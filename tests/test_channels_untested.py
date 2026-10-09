@@ -134,6 +134,7 @@ class TestDingTalkChannel:
 
         event = OutboundEvent.text_reply(channel="dingtalk", chat_id="user1", text="hi")
         event.metadata = {}
+        mock_resp.json = AsyncMock(return_value={"processQueryKey": "receipt1"})
         result = await ch.send(event)
         assert result.success is True
         call_args = ch._session.post.call_args
@@ -156,6 +157,7 @@ class TestDingTalkChannel:
 
         event = OutboundEvent.text_reply(channel="dingtalk", chat_id="conv123", text="hi group")
         event.metadata = {"conversation_type": "2"}
+        mock_resp.json = AsyncMock(return_value={"processQueryKey": "receipt2"})
         result = await ch.send(event)
         assert result.success is True
         call_args = ch._session.post.call_args
@@ -189,6 +191,7 @@ class TestDingTalkChannel:
 
         event = OutboundEvent.text_reply(channel="dingtalk", chat_id="u1", text="test")
         event.metadata = {}
+        mock_resp.json = AsyncMock(return_value={"code": "forbidden", "message": "forbidden"})
         result = await ch.send(event)
         assert result.success is False
         assert "forbidden" in result.error

@@ -78,7 +78,7 @@ Stream Mode 下**无需配置公网回调地址**。连接流程如下：
 |------|----------|------|
 | 消息编辑 | ❌ | 钉钉 API 不支持修改已发送消息 |
 | 表情回应 | ❌ | 不支持 |
-| 文件发送 | ❌ | 当前未实现 |
+| 文件发送 | ✅ | 本地文件/图片上传，支持单聊和群聊，最大 20MB |
 | 实时消息 | ✅ | Stream Mode WebSocket 推送 |
 | 群聊 | ✅ | 通过 `openConversationId` 路由 |
 | 单聊 | ✅ | 通过 staffId 路由 |
@@ -87,6 +87,30 @@ Stream Mode 下**无需配置公网回调地址**。连接流程如下：
 
 - 单聊：`POST /v1.0/robot/oToMessages/batchSend`
 - 群聊：`POST /v1.0/robot/groupMessages/send`（需要 `openConversationId`）
+
+---
+
+## 文件发送
+
+使用 gateway 已有的 `send_file` 工具即可发送本地附件：
+
+```json
+{
+  "channel": "dingtalk",
+  "chat_id": "cid你的群会话ID==",
+  "file_path": "/absolute/path/report.docx",
+  "caption": "您的报告"
+}
+```
+
+- 单聊 `chat_id` 使用企业用户 `userId`（入站回调的 `senderStaffId`），不是个人钉钉号。
+- 群聊使用回调的 `conversationId`（通常以 `cid` 开头），不是客户端显示的群号。工具事件没有 `conversation_type` 时，通道按 `cid` 前缀识别群聊；显式元数据优先。
+- 文件支持 `xlsx`、`pdf`、`zip`、`rar`、`doc`、`docx`；图片支持 `jpg`、`gif`、`png`、`bmp`，按图片模板发送。其他格式请先打包成 ZIP。仅接受本地非空文件，每个文件最大 20MB。
+- 应用需开通「企业内机器人发送消息权限」，机器人需加入目标群聊。媒体上传权限默认开通。
+
+通道先检查文件，再通过 `POST https://oapi.dingtalk.com/media/upload` 上传，取得 `media_id` 后使用 `sampleFile`（图片为 `sampleImageMsg`）发送。caption 会作为独立文本先发送。上传失败、发送失败、接收人无效或被限流都会返回失败，不会仅因文本发出就报告文件成功；发送回执不代表用户已经阅读或下载文件。
+
+接口依据：[上传媒体文件](https://open.dingtalk.com/document/orgapp/upload-media-files)、[企业机器人消息类型](https://open.dingtalk.com/document/orgapp/types-of-messages-sent-by-robots)、[单聊发送](https://open.dingtalk.com/document/orgapp/chatbots-send-one-on-one-chat-messages-in-batches)、[群聊发送](https://open.dingtalk.com/document/orgapp/the-robot-sends-a-group-message)。
 
 ---
 

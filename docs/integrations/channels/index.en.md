@@ -53,7 +53,7 @@ There are 14 channels, matching `_CHANNEL_REGISTRY` in `echo_agent/channels/mana
 | WeChat | `weixin` | Long polling | ❌ | ❌ | ✅ | ✅ |
 | QQ Bot | `qqbot` | WebSocket (Gateway) | ❌ | ❌ | ⚠️ | ✅ |
 | WeCom (WeChat Work) | `wecom` | Webhook callback | ❌ | ❌ | ❌ | ✅ |
-| DingTalk | `dingtalk` | WebSocket | ❌ | ❌ | ❌ | ✅ |
+| DingTalk | `dingtalk` | WebSocket | ❌ | ❌ | ✅ | ✅ |
 | Feishu / Lark | `feishu` | Webhook event subscription | ❌ | ❌ | ❌ | ✅ |
 | WhatsApp | `whatsapp` | Webhook callback | ❌ | ❌ | ❌ | ✅ |
 | Email | `email` | IMAP polling / SMTP send | ❌ | ❌ | ❌ | ❌ |

@@ -78,7 +78,7 @@ Stream Mode requires **no public callback URL**. The connection flow is:
 |-----------|-----------|-------|
 | Message editing | ❌ | DingTalk API does not support modifying sent messages |
 | Reactions | ❌ | Not supported |
-| File sending | ❌ | Not currently implemented |
+| File sending | ✅ | Local files/images in direct and group chats, up to 20MB |
 | Real-time messages | ✅ | Stream Mode WebSocket push |
 | Group chat | ✅ | Routed via `openConversationId` |
 | Direct chat | ✅ | Routed via staffId |
@@ -87,6 +87,30 @@ Stream Mode requires **no public callback URL**. The connection flow is:
 
 - Direct messages: `POST /v1.0/robot/oToMessages/batchSend`
 - Group messages: `POST /v1.0/robot/groupMessages/send` (requires `openConversationId`)
+
+---
+
+## Sending Files
+
+Use the gateway's existing `send_file` tool:
+
+```json
+{
+  "channel": "dingtalk",
+  "chat_id": "cidYourGroupConversationId==",
+  "file_path": "/absolute/path/report.docx",
+  "caption": "Your report"
+}
+```
+
+- Direct chats use the enterprise `userId` (`senderStaffId` in callbacks), not a personal DingTalk handle.
+- Groups use the callback's `conversationId`, typically starting with `cid`, not the group number shown in the client. Without `conversation_type` metadata, tool events route `cid` IDs to the group API; explicit metadata takes precedence.
+- Files: `xlsx`, `pdf`, `zip`, `rar`, `doc`, `docx`. Images: `jpg`, `gif`, `png`, `bmp`, delivered using the image template. Archive other formats as ZIP first. Only nonempty local files are accepted, up to 20MB each.
+- Enable the enterprise robot message-sending permission and add the robot to the target group. Media-upload permission is enabled by default.
+
+The channel validates files, uploads them through `POST https://oapi.dingtalk.com/media/upload`, then sends the returned `media_id` using `sampleFile` (`sampleImageMsg` for images). The caption is sent first as a separate text message. Upload errors, send errors, invalid recipients and recipient throttling return failure; a delivered caption alone never counts as a delivered file. A send receipt does not mean the recipient has read or downloaded the file.
+
+API references: [media upload](https://open.dingtalk.com/document/orgapp/upload-media-files), [robot message types](https://open.dingtalk.com/document/orgapp/types-of-messages-sent-by-robots), [direct messages](https://open.dingtalk.com/document/orgapp/chatbots-send-one-on-one-chat-messages-in-batches), [group messages](https://open.dingtalk.com/document/orgapp/the-robot-sends-a-group-message).
 
 ---
 

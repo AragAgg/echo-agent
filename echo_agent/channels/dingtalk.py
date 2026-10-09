@@ -4,14 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+import mimetypes
 import time
-import uuid
+from pathlib import Path
 from typing import Any
 
 import aiohttp
 from loguru import logger
 
-from echo_agent.bus.events import OutboundEvent
+from echo_agent.bus.events import ContentBlock, ContentType, OutboundEvent
 from echo_agent.bus.queue import MessageBus
 from echo_agent.channels.base import BaseChannel, SendResult
 from echo_agent.config.schema import DingTalkChannelConfig
@@ -20,10 +21,19 @@ _API_BASE = "https://api.dingtalk.com"
 _OAPI_BASE = "https://oapi.dingtalk.com"
 _RECONNECT_BACKOFFS = [2, 5, 10, 30, 60]
 _RATE_LIMIT_BACKOFF = 300
+# Limits and formats documented by DingTalk's media upload and robot templates.
+_MAX_FILE_BYTES = 20 * 1024 * 1024
+_FILE_TYPES = frozenset({"xlsx", "pdf", "zip", "rar", "doc", "docx"})
+_IMAGE_TYPES = frozenset({"jpg", "gif", "png", "bmp"})
+_SEND_TIMEOUT = aiohttp.ClientTimeout(total=30)
+_UPLOAD_TIMEOUT = aiohttp.ClientTimeout(total=120)
+_BOT_MESSAGE_TOPIC = "/v1.0/im/bot/messages/get"
 
 
 class DingTalkChannel(BaseChannel):
     name = "dingtalk"
+    # send_file publishes FILE/IMAGE blocks; both now reach the media API.
+    supports_files = True
 
     def __init__(self, config: DingTalkChannelConfig, bus: MessageBus):
         super().__init__(config, bus)
@@ -58,38 +68,132 @@ class DingTalkChannel(BaseChannel):
             await self._session.close()
 
     async def send(self, event: OutboundEvent) -> SendResult | None:
+        """Validate local attachments, then deliver caption and media in order.
+
+        Fail the entire receipt when any part fails so send_file cannot report
+        a caption-only delivery as a successful attachment upload.
+        """
         if not self.should_deliver(event):
             return SendResult(success=True, skipped=True)
         text = event.text or ""
-        if not text or not self._session:
-            return SendResult(success=False, error="no text or no session")
-        await self._ensure_token()
+        attachments = [b for b in event.content if b.type in (ContentType.FILE, ContentType.IMAGE)]
+        if not self._session:
+            return SendResult(success=False, error="DingTalk send: no session")
+        if not text and not attachments:
+            return SendResult(success=False, error="DingTalk send: no text or files")
+        try:
+            # Preflight every attachment before posting even the caption. Reads
+            # are bounded and run off the event loop to keep Stream responsive.
+            files = [await asyncio.to_thread(self._read_attachment, block) for block in attachments]
+            await self._ensure_token()
+            if not self._access_token or time.time() >= self._token_expires:
+                raise RuntimeError("DingTalk send: access token refresh failed")
+            result = SendResult(success=True)
+            if text:
+                result = await self._send_message(event, "sampleText", {"content": text})
+            for name, file_type, media_type, data in files:
+                media_id = await self._upload_media(name, media_type, data)
+                if media_type == "image":
+                    result = await self._send_message(event, "sampleImageMsg", {"photoURL": media_id})
+                else:
+                    result = await self._send_message(event, "sampleFile", {
+                        "mediaId": media_id, "fileName": name, "fileType": file_type,
+                    })
+            return result
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            # aiohttp exceptions can contain the upload URL's access_token.
+            error = f"DingTalk send: network failure ({type(exc).__name__})"
+        except (OSError, ValueError, RuntimeError) as exc:
+            error = str(exc)
+        for secret in (self._access_token, self._app_key, self._app_secret):
+            if secret:
+                error = error.replace(secret, "[redacted]")
+        logger.warning("DingTalk send failed: {}", error)
+        return SendResult(success=False, error=error)
+
+    @staticmethod
+    def _read_attachment(block: ContentBlock) -> tuple[str, str, str, bytes]:
+        """Read a regular local file within DingTalk's size and format limits."""
+        path = Path(block.url)
+        if not block.url or not path.exists():
+            raise ValueError("DingTalk file not found")
+        if not path.is_file():
+            raise ValueError("DingTalk attachment must be a regular file")
+        name = path.name
+        file_type = path.suffix.lstrip(".").lower()
+        media_type = "image" if file_type in _IMAGE_TYPES else "file"
+        if file_type not in _FILE_TYPES | _IMAGE_TYPES:
+            raise ValueError(f"DingTalk unsupported file type: {file_type or '(none)'}; use a ZIP archive")
+        if path.stat().st_size > _MAX_FILE_BYTES:
+            raise ValueError("DingTalk file exceeds 20 MB limit")
+        with path.open("rb") as file:
+            data = file.read(_MAX_FILE_BYTES + 1)
+        if not data:
+            raise ValueError("DingTalk file is empty")
+        if len(data) > _MAX_FILE_BYTES:
+            raise ValueError("DingTalk file exceeds 20 MB limit")
+        return name, file_type, media_type, data
+
+    async def _upload_media(self, name: str, media_type: str, data: bytes) -> str:
+        """Upload multipart media using the legacy API's query-token auth."""
+        form = aiohttp.FormData(quote_fields=False)
+        form.add_field("type", media_type)
+        form.add_field("media", data, filename=name,
+                       content_type=mimetypes.guess_type(name)[0] or "application/octet-stream")
+        async with self._session.post(
+            f"{_OAPI_BASE}/media/upload", params={"access_token": self._access_token},
+            data=form, timeout=_UPLOAD_TIMEOUT,
+        ) as resp:
+            body = await self._read_api_response(resp, "upload")
+        media_id = body.get("media_id")
+        if not isinstance(media_id, str) or not media_id:
+            raise RuntimeError("DingTalk upload: missing media_id")
+        return media_id
+
+    async def _send_message(self, event: OutboundEvent, msg_key: str, msg_param: dict[str, str]) -> SendResult:
+        """Use one routing path for text and attachment templates."""
         url = f"{_API_BASE}/v1.0/robot/oToMessages/batchSend"
         payload = {
             "robotCode": self._robot_code,
             "userIds": [event.chat_id],
-            "msgKey": "sampleText",
-            "msgParam": json.dumps({"content": text}),
+            "msgKey": msg_key,
+            "msgParam": json.dumps(msg_param, ensure_ascii=False),
         }
-        if event.metadata.get("conversation_type") == "2":
+        # Tool-generated events lack inbound metadata. DingTalk conversation IDs
+        # use cid..., while explicit callback metadata remains authoritative.
+        conversation_type = str(event.metadata.get("conversation_type", ""))
+        if conversation_type == "2" or (not conversation_type and event.chat_id.startswith("cid")):
             url = f"{_API_BASE}/v1.0/robot/groupMessages/send"
-            payload = {
-                "robotCode": self._robot_code,
-                "openConversationId": event.chat_id,
-                "msgKey": "sampleText",
-                "msgParam": json.dumps({"content": text}),
-            }
+            payload.pop("userIds")
+            payload["openConversationId"] = event.chat_id
         headers = {"x-acs-dingtalk-access-token": self._access_token}
+        async with self._session.post(url, json=payload, headers=headers, timeout=_SEND_TIMEOUT) as resp:
+            body = await self._read_api_response(resp, "message")
+        # batchSend can accept the request yet reject this particular recipient.
+        for field in ("invalidStaffIdList", "flowControlledStaffIdList"):
+            if body.get(field):
+                raise RuntimeError(f"DingTalk message: recipient rejected ({field})")
+        message_id = body.get("processQueryKey")
+        if not isinstance(message_id, str) or not message_id:
+            raise RuntimeError("DingTalk message: missing processQueryKey")
+        return SendResult(success=True, message_id=message_id)
+
+    @staticmethod
+    async def _read_api_response(resp: aiohttp.ClientResponse, action: str) -> dict[str, Any]:
+        """Reject HTTP and business errors before trusting a delivery receipt."""
         try:
-            async with self._session.post(url, json=payload, headers=headers) as resp:
-                if resp.status >= 400:
-                    body = await resp.text()
-                    logger.warning("DingTalk send failed ({}): {}", resp.status, body[:200])
-                    return SendResult(success=False, error=body[:200])
-        except Exception as e:
-            logger.error("DingTalk send error: {}", e)
-            return SendResult(success=False, error=str(e))
-        return SendResult(success=True)
+            body = await resp.json()
+        except (ValueError, aiohttp.ContentTypeError) as exc:
+            if resp.status >= 400:
+                raise RuntimeError(f"DingTalk {action}: HTTP {resp.status}: {(await resp.text())[:200]}") from exc
+            raise RuntimeError(f"DingTalk {action}: invalid JSON response") from exc
+        if not isinstance(body, dict):
+            raise RuntimeError(f"DingTalk {action}: invalid JSON object")
+        code = body.get("errcode", body.get("code", 0))
+        if resp.status >= 400 or code not in (0, "0", None):
+            detail = str(body.get("errmsg", body.get("message", "")))[:200]
+            raise RuntimeError(f"DingTalk {action}: HTTP {resp.status}, code={code}: {detail}")
+        return body
 
     async def _callback_register_and_poll(self) -> None:
         backoff_idx = 0
@@ -102,7 +206,13 @@ class DingTalkChannel(BaseChannel):
                 await self._ensure_token()
                 url = f"{_API_BASE}/v1.0/gateway/connections/open"
                 headers = {"x-acs-dingtalk-access-token": self._access_token}
-                payload = {"clientId": uuid.uuid4().hex, "clientSecret": self._app_secret}
+                # Stream authenticates the application and requires an explicit
+                # callback subscription to receive messages asking for files.
+                payload = {
+                    "clientId": self._app_key,
+                    "clientSecret": self._app_secret,
+                    "subscriptions": [{"type": "CALLBACK", "topic": _BOT_MESSAGE_TOPIC}],
+                }
                 async with self._session.post(url, json=payload, headers=headers) as resp:
                     if resp.status == 429:
                         self._rate_limited_until = time.time() + _RATE_LIMIT_BACKOFF
@@ -142,10 +252,22 @@ class DingTalkChannel(BaseChannel):
                     data = json.loads(msg.data)
                     headers = data.get("headers", {})
                     topic = headers.get("topic", "")
-                    if topic == "/v1.0/im/bot/messages/get":
+                    ack_data = json.dumps({"response": "OK"})
+                    if topic == _BOT_MESSAGE_TOPIC:
                         payload = json.loads(data.get("data", "{}"))
                         await self._on_message(payload)
-                    await ws.send_json({"code": 200, "headers": headers, "message": "OK", "data": ""})
+                    elif data.get("type") == "SYSTEM":
+                        # System pings carry opaque data that must be echoed;
+                        # an empty ACK lets the server close a healthy stream.
+                        ack_data = data.get("data", "{}")
+                    await ws.send_json({
+                        "code": 200,
+                        "headers": {"messageId": headers.get("messageId", ""),
+                                    "contentType": "application/json"},
+                        "message": "OK", "data": ack_data,
+                    })
+                    if data.get("type") == "SYSTEM" and topic == "disconnect":
+                        break
                 elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                     break
 

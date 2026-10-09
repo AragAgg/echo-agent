@@ -53,7 +53,7 @@ class BaseChannel(ABC):
 | 微信 | `weixin` | 长轮询 | ❌ | ❌ | ✅ | ✅ |
 | QQ 机器人 | `qqbot` | WebSocket (Gateway) | ❌ | ❌ | ⚠️ | ✅ |
 | 企业微信 | `wecom` | Webhook 回调 | ❌ | ❌ | ❌ | ✅ |
-| 钉钉 | `dingtalk` | WebSocket | ❌ | ❌ | ❌ | ✅ |
+| 钉钉 | `dingtalk` | WebSocket | ❌ | ❌ | ✅ | ✅ |
 | 飞书 / Lark | `feishu` | Webhook 事件订阅 | ❌ | ❌ | ❌ | ✅ |
 | WhatsApp | `whatsapp` | Webhook 回调 | ❌ | ❌ | ❌ | ✅ |
 | Email | `email` | IMAP 轮询 / SMTP 发送 | ❌ | ❌ | ❌ | ❌ |
