@@ -5,6 +5,8 @@
 """
 import json
 
+import pytest
+
 from echo_agent.agent.clarify_manager import ClarifyManager
 from echo_agent.agent.tools.clarify import CLI_CHANNEL, ClarifyTool
 from echo_agent.agent.tools.registry import ToolRegistry
@@ -61,6 +63,21 @@ def test_render_text_tells_the_user_how_to_answer():
 
 def test_render_text_without_options_is_just_the_question():
     assert ClarifyTool._render_text("你想先做什么？", []) == "你想先做什么？"
+
+
+@pytest.mark.parametrize("options", [
+    ["A 七猫", "B 点众"], [" A. 七猫", " b. 点众"],
+    ["A、七猫", "B：点众"], ["A) 七猫", "B）点众"],
+])
+def test_model_supplied_labels_are_rendered_once(options):
+    rendered = ClarifyTool._render_text("平台选哪个？", options)
+    assert "A. 七猫" in rendered and "B. 点众" in rendered
+    assert "A. A" not in rendered and "B. B" not in rendered
+
+
+def test_option_content_starting_with_letter_is_preserved():
+    rendered = ClarifyTool._render_text("选哪个？", ["AI 分析", "B站素材"])
+    assert "A. AI 分析" in rendered and "B. B站素材" in rendered
 
 
 def test_options_parameter_description_matches_the_channel():

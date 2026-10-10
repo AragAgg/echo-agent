@@ -7,6 +7,7 @@ without blocking — blocking IM clarify is a future iteration (see spec)."""
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from echo_agent.agent.clarify_manager import ClarifyManager
@@ -26,7 +27,8 @@ _TEXT_OPTIONS_DESCRIPTION = (
     "The choices to offer the user, one per entry. Provide these whenever the "
     "user should pick from a fixed set. They are rendered as a plain text list "
     "labelled A, B, C..., which the user answers by replying with a letter — so "
-    "keep each option short. Omit only for a genuinely open-ended (free-text) question."
+    "keep each option short and omit letter prefixes; the renderer adds them. "
+    "Omit only for a genuinely open-ended (free-text) question."
 )
 
 
@@ -96,10 +98,12 @@ class ClarifyTool(Tool):
         lines: list[str] = []
         for i, opt in enumerate(options):
             label = f"{chr(65 + i)}. "
-            # 模型可能已添加同一字母标签；正文与续接引用都只显示一次。
-            text = str(opt)
-            if text.startswith(label):
-                text = text[len(label):]
+            # Models use "A 七猫", "A. 七猫" or Chinese separators. Remove only
+            # this option's explicit label, preserving content such as "AI 分析".
+            text = re.sub(
+                rf"^\s*{re.escape(chr(65 + i))}(?:[.．、:：)）]\s*|\s+)",
+                "", str(opt), count=1, flags=re.IGNORECASE,
+            )
             lines.append(f"  {label}{text}")
         choices = "\n".join(lines)
         return f"{question}\n{choices}\n（直接回复选项字母或你的答案即可）"
