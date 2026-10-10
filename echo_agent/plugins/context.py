@@ -9,8 +9,10 @@ from loguru import logger
 
 from echo_agent.plugins.errors import PluginPermissionError
 from echo_agent.plugins.hooks import HookCallback, HookRegistry
+from echo_agent.plugins.runtime import RuntimeExtension, RuntimeExtensionSlot
 
 if TYPE_CHECKING:
+    from echo_agent.bus.delivery import DeliveryResult
     from echo_agent.tools import Tool
     from echo_agent.agent.tools.registry import ToolRegistry
     from echo_agent.bus.events import InboundEvent, OutboundEvent
@@ -43,6 +45,7 @@ class PluginContext:
         tool_registration_allowed: Callable[[], bool] | None = None,
         hook_registration_allowed: Callable[[], bool] | None = None,
         registration_mode: str = "compat",
+        runtime_slot: RuntimeExtensionSlot | None = None,
     ) -> None:
         self._plugin_name = plugin_name
         self._config = config
@@ -55,6 +58,7 @@ class PluginContext:
         self._tool_registration_allowed = tool_registration_allowed
         self._hook_registration_allowed = hook_registration_allowed
         self._registration_mode = registration_mode
+        self._runtime_slot = runtime_slot
         self._logger = logger.bind(plugin=plugin_name)
         self._registered_tools: list[str] = []
         # Keep the exact instances as well as their public names.  Lifecycle
@@ -128,9 +132,20 @@ class PluginContext:
 
     # ── Event bus access ───────────────────────────────────────────────────
 
-    async def publish_outbound(self, event: "OutboundEvent") -> None:
+    def register_runtime_extension(self, extension: RuntimeExtension) -> None:
+        """Register trusted conversation policy; denied registration always fails closed."""
+        if not self._registration_allowed("hook.register", self._hook_registration_allowed):
+            raise PluginPermissionError(self._plugin_name, "runtime extension requires hook.register")
+        if self._plugin_name not in self._config.plugins.required:
+            raise RuntimeError("runtime extension must be declared as a required plugin")
+        if self._runtime_slot is None:
+            raise RuntimeError("runtime extension host unavailable")
+        extension.validate_config(self._config)
+        self._runtime_slot.register(self._plugin_name, extension)
+
+    async def publish_outbound(self, event: "OutboundEvent") -> "DeliveryResult":
         """Publish an outbound event (progress, streaming, etc.)."""
-        await self._bus.publish_outbound(event)
+        return await self._bus.publish_outbound(event)
 
     def subscribe_inbound(self, handler: InboundHandler) -> None:
         """Subscribe to inbound events (read-only observation).

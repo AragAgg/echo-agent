@@ -93,7 +93,15 @@ class ClarifyTool(Tool):
         # sees the same labels the model is later told the options were. Letters
         # also survive dictation better than digits, which collide with numbers
         # appearing inside the option text.
-        choices = "\n".join(f"  {chr(65 + i)}. {opt}" for i, opt in enumerate(options))
+        lines: list[str] = []
+        for i, opt in enumerate(options):
+            label = f"{chr(65 + i)}. "
+            # 模型可能已添加同一字母标签；正文与续接引用都只显示一次。
+            text = str(opt)
+            if text.startswith(label):
+                text = text[len(label):]
+            lines.append(f"  {label}{text}")
+        choices = "\n".join(lines)
         return f"{question}\n{choices}\n（直接回复选项字母或你的答案即可）"
 
     @staticmethod

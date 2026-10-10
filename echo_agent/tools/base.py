@@ -86,6 +86,8 @@ class ToolExecutionContext:
     # InboundEvent.unattended for why that distinction is load-bearing.
     unattended: bool = False
     cron_authorized: bool = False
+    # Preserve native ingress provenance for project identity signing.
+    channel_verified: bool = False
     # The inbound event this turn is answering. Tools that publish an
     # OutboundEvent themselves (message / notify / send_file / tts) must stamp it
     # so the delivery layer can tell "this turn already sent something to this

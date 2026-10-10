@@ -188,6 +188,10 @@ class ToolRegistry:
     def get_definitions(self, channel: str | None = None) -> list[dict[str, Any]]:
         definitions: list[dict[str, Any]] = []
         for tool in self._tools.values():
+            if self._config is not None:
+                from echo_agent.security.tool_policy import is_tool_allowed
+                if not is_tool_allowed(self._config, tool):
+                    continue
             try:
                 definitions.append(tool.to_schema(channel))
             except ValueError as e:
@@ -200,6 +204,10 @@ class ToolRegistry:
         for tool in self._tools.values():
             if not tool.is_ready():
                 continue
+            if self._config is not None:
+                from echo_agent.security.tool_policy import is_tool_allowed
+                if not is_tool_allowed(self._config, tool):
+                    continue
             try:
                 definitions.append(tool.to_schema(channel))
             except ValueError as e:

@@ -559,6 +559,10 @@ class ContextStage:
             capabilities=capabilities_ctx,
             channel=event.channel,
         )
+        # Optional instructions belong to the installed plugin, not the core prompt.
+        extension = self._config._runtime_extension
+        if extension is not None:
+            system_prompt += extension.system_instructions
 
         history = session.get_history(self._config.session.max_history_messages)
         if self._compressor.should_compress(history):

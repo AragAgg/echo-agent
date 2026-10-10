@@ -71,6 +71,8 @@ class _LoopResult:
     """Output of one tool loop pass, used by run() to orchestrate reflection/rerun."""
 
     response_text: str = ""
+    # IM 提问已生成；本轮回复必须交付原问题，并等待下一条用户消息。
+    awaiting_clarification: bool = False
     total_tool_calls: int = 0
     loop_exhausted: bool = True
     # True when the daily cost budget halted the loop mid-task. The task is
@@ -124,6 +126,8 @@ class _BatchCounters:
     should_review_memory: bool
     degraded_notices: list
     successful_tools: set[str] = field(default_factory=set)
+    # 仅成功的 IM clarify 设置，失败/CLI 结果不能提前终止推理。
+    im_clarification_text: str = ""
 
 
 @dataclass
@@ -525,6 +529,7 @@ class InferenceStage:
         # 推理会违背用户意图，也会覆盖掉已生成的停止文案。
         if (
             not loop_result.interrupted
+            and not loop_result.awaiting_clarification
             and not loop_result.output_truncated
             and not loop_result.artifact_incomplete
             and not ctx.artifact_required
@@ -561,6 +566,7 @@ class InferenceStage:
                 second = await self._run_tool_loop(ctx, messages)
                 loop_result = _LoopResult(
                     response_text=second.response_text or loop_result.response_text,
+                    awaiting_clarification=second.awaiting_clarification,
                     total_tool_calls=loop_result.total_tool_calls + second.total_tool_calls,
                     loop_exhausted=second.loop_exhausted,
                     budget_halted=second.budget_halted,
@@ -631,7 +637,9 @@ class InferenceStage:
                     or loop_result.artifact_incomplete
                     or plan_failed
                 )
-                if task_incomplete:
+                if loop_result.awaiting_clarification:
+                    status = "running"
+                elif task_incomplete:
                     status = "exhausted"
                 elif loop_result.response_text:
                     status = "complete"
@@ -668,10 +676,12 @@ class InferenceStage:
                 or loop_result.output_truncated
                 or loop_result.content_filtered
                 or loop_result.artifact_incomplete
+                or loop_result.awaiting_clarification
                 or plan_failed
             ),
             output_truncated=loop_result.output_truncated,
             termination_reason=(
+                "awaiting_clarification" if loop_result.awaiting_clarification else
                 "interrupted" if loop_result.interrupted else
                 "output_truncated" if loop_result.output_truncated else
                 "content_filtered" if loop_result.content_filtered else
@@ -716,6 +726,7 @@ class InferenceStage:
         content_filtered = False
         artifact_incomplete = False
         output_truncated = False
+        awaiting_clarification = False
         artifact_contract_retries = 0
 
         # Read nudge counters from session (do NOT write back — run() owns that)
@@ -1150,6 +1161,15 @@ class InferenceStage:
                 response_text = "报告已生成、校验并交付。"
                 loop_exhausted = False
                 break
+            if counters.im_clarification_text:
+                # 工具结果不是已发送消息。将本次解释和原问题一起交给正常出站链路，
+                # 不再让模型把问题替换成“已发给你”；下一轮仍沿用 IM 答案绑定。
+                response_text = "\n\n".join(part for part in (
+                    (response.content or "").strip(), counters.im_clarification_text,
+                ) if part)
+                awaiting_clarification = True
+                loop_exhausted = False
+                break
 
         if loop_exhausted:
             logger.warning(
@@ -1194,6 +1214,7 @@ class InferenceStage:
 
         return _LoopResult(
             response_text=response_text,
+            awaiting_clarification=awaiting_clarification,
             total_tool_calls=counters.total_tool_calls,
             loop_exhausted=loop_exhausted,
             budget_halted=budget_halted,
@@ -1363,6 +1384,7 @@ class InferenceStage:
                 # channels populate from untrusted input.
                 unattended=bool(getattr(event, "unattended", False)),
                 cron_authorized=bool(getattr(event, "cron_authorized", False)),
+                channel_verified=getattr(event, 'channel_verified', False) is True,
             )
 
             # pre_tool_call hook (may cancel/modify); modifications applied in place
@@ -1618,6 +1640,8 @@ class InferenceStage:
             if result.success:
                 self._circuit_breaker.record_success(tool_call.name)
                 counters.successful_tools.add(tool_call.name)
+                if tool_call.name == "clarify" and not should_emit_cognitive(event.channel):
+                    counters.im_clarification_text = result_text
             elif result.is_infra_failure:
                 self._circuit_breaker.record_failure(tool_call.name)
 

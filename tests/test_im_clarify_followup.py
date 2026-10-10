@@ -8,6 +8,8 @@
 
 import time
 
+import pytest
+
 from echo_agent.agent.clarify_manager import ClarifyManager
 from echo_agent.agent.loop import AgentLoop
 from echo_agent.agent.pipeline.context_stage import build_user_message_with_reply
@@ -26,6 +28,81 @@ class _StubProvider(LLMProvider):
 
     def get_default_model(self):
         return "stub"
+
+
+# /***********************************************************
+#  *                    钉钉追问投递回归                      *
+# /***********************************************************/
+
+class _QuestionProvider(_StubProvider):
+    """模拟截图中的模型调用；仅模型边界替身，执行真实提问工具和消息总线。"""
+
+    def __init__(self, options):
+        super().__init__()
+        self.calls = 0
+        self.options = options
+
+    async def chat(self, messages, tools=None, model=None, tool_choice=None, **kwargs):
+        from echo_agent.models.provider import ToolCallRequest
+        self.calls += 1
+        if self.calls == 1:
+            return LLMResponse(
+                content="可以，拉取不影响使用已有素材创建任务。",
+                tool_calls=[ToolCallRequest(id="question", name="clarify", arguments={
+                    "question": "你想按什么条件筛选？", "options": self.options,
+                })], finish_reason="tool_calls",
+            )
+        return LLMResponse(content="问题已发给你，回一个字母即可。", finish_reason="stop")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("options", [["按平台筛选", "按热度排序"], ["A. 按平台筛选", "B. 按热度排序"], []])
+@pytest.mark.parametrize("delivery_success", [True, False])
+async def test_dingtalk_clarify_reaches_outbound_with_answer_and_options(tmp_path, options, delivery_success):
+    """真实 AgentLoop 出站必须带上解释、问题和选项，不能只投递已发送宣称。"""
+    from echo_agent.channels.base import SendResult
+    provider = _QuestionProvider(options)
+    config = load_config(overrides={"workspace": str(tmp_path), "memory": {"enabled": False}})
+    bus = MessageBus()
+    loop = AgentLoop(bus=bus, config=config, provider=provider, workspace=tmp_path)
+    loop._running = True
+    sent = []
+
+    async def receive(event):
+        if event.is_final:
+            sent.append(event)
+        return SendResult(success=delivery_success)
+
+    bus.subscribe_outbound("dingtalk", receive)
+    await loop._on_inbound(InboundEvent.text_message(
+        channel="dingtalk", chat_id="staff", sender_id="staff",
+        text="现在可以从已有列表筛选创建新书名任务吗？", event_id="question-event",
+    ))
+    assert len(sent) == 1
+    text = sent[0].text
+    assert "可以，拉取不影响" in text
+    assert "你想按什么条件筛选？" in text
+    if options:
+        assert "A. 按平台筛选" in text and "B. 按热度排序" in text
+        assert "A. A." not in text and "B. B." not in text
+    assert "问题已发给你" not in text
+    assert provider.calls == 1
+    pending = loop.clarify._im_pending.get("dingtalk:staff")
+    if not delivery_success:
+        assert pending is None  # 未发出的提问不能占用下一条用户消息。
+        return
+    assert pending is not None and pending.options == options
+    answer = InboundEvent.text_message(
+        channel="dingtalk", chat_id="staff", sender_id="staff",
+        text="B" if options else "番茄热度前10", event_id="answer-event",
+    )
+    await loop._on_inbound(answer)
+    assert provider.calls == 2
+    assert "你想按什么条件筛选？" in answer.reply_to_text
+    if options:
+        assert "B. 按热度排序" in answer.reply_to_text
+        assert "B. B." not in answer.reply_to_text
+    assert loop.clarify.take_im_pending("dingtalk:staff", ttl_seconds=300) is None
 
 
 def _make_loop(tmp_path):

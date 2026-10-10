@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from fnmatch import fnmatchcase
 from typing import TYPE_CHECKING
 
 from loguru import logger
@@ -140,6 +141,14 @@ def tool_policy_decision(config: "Config", tool: object) -> tuple[bool, str]:
 
     if name in deny:
         return False, "explicitly denied by tools.deny"
+
+    # An installed runtime policy is an exclusive allowlist. Operator deny stays first.
+    extension = config._runtime_extension
+    patterns = extension.allowed_tool_patterns if extension is not None else None
+    if patterns is not None:
+        if any(fnmatchcase(name, pattern) for pattern in patterns):
+            return True, "allowed by installed runtime extension"
+        return False, "outside installed runtime extension policy"
 
     if tools_cfg.allow:
         base_allowed = name in tools_cfg.allow

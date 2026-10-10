@@ -190,9 +190,14 @@ class MCPClient:
 
     async def call_tool(
         self, name: str, arguments: dict[str, Any] | None = None, timeout: float = 120,
+        *, metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        # Request-local MCP metadata must not alter the connection's shared headers.
+        params = {"name": name, "arguments": arguments or {}}
+        if metadata is not None:
+            params['_meta'] = metadata
         return await self._request(
-            "tools/call", {"name": name, "arguments": arguments or {}}, timeout=timeout,
+            "tools/call", params, timeout=timeout,
         )
 
     async def list_resources(self, timeout: float = 30) -> list[dict[str, Any]]:

@@ -32,6 +32,8 @@ class SendResult:
 
 
 class BaseChannel(ABC):
+    # Native implementations explicitly vouch for their authenticated callbacks.
+    authenticated_ingress: bool = False
     """Abstract base for chat channel implementations.
 
     Each channel (Telegram, Discord, Webhook, CLI, Cron, etc.) implements this
@@ -157,6 +159,7 @@ class BaseChannel(ABC):
         reply_to_is_own: bool = False,
         thread_id: str | None = None,
         is_group: bool = False,
+        event_id: str | None = None,
     ) -> InboundEvent:
         if not self.is_allowed(sender_id):
             logger.warning("Access denied for sender {} on channel {}", sender_id, self.name)
@@ -191,7 +194,7 @@ class BaseChannel(ABC):
                 metadata=meta,
             ))
 
-        return InboundEvent(
+        event = InboundEvent(
             channel=self.name,
             sender_id=str(sender_id),
             chat_id=str(chat_id),
@@ -205,6 +208,10 @@ class BaseChannel(ABC):
             metadata=safe_metadata,
             is_group=is_group,
         )
+        if isinstance(event_id, str) and event_id.strip() and len(event_id) <= 200:
+            event.event_id = event_id
+            event.channel_verified = self.authenticated_ingress
+        return event
 
     async def _handle_message(
         self,
@@ -220,6 +227,7 @@ class BaseChannel(ABC):
         reply_to_is_own: bool = False,
         thread_id: str | None = None,
         is_group: bool = False,
+        event_id: str | None = None,
     ) -> InboundEvent | None:
         try:
             event = self._build_event(
@@ -235,6 +243,7 @@ class BaseChannel(ABC):
                 reply_to_is_own=reply_to_is_own,
                 thread_id=thread_id,
                 is_group=is_group,
+                **({'event_id': event_id} if event_id is not None else {}),
             )
         except PermissionError:
             return None

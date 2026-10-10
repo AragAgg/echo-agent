@@ -168,6 +168,8 @@ class InboundEvent:
     # approval gate's _is_unattended / _resolve_unattended for the consumers.
     unattended: bool = False       # no human at the keyboard (scheduled/cron run)
     cron_authorized: bool = False  # this specific job passed the up-front cronjob approval
+    # Authenticated native ingress only; gateway metadata cannot set this field.
+    channel_verified: bool = False
     # Internal control command (e.g. the synthesized clarify-cancel on ws
     # disconnect). Like the trust signals above, this is a FIRST-CLASS typed
     # field — NOT a metadata key — precisely because it bypasses the session

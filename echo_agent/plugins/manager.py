@@ -12,6 +12,7 @@ from loguru import logger
 from echo_agent.plugins.context import PluginContext
 from echo_agent.plugins.errors import PluginPermissionError
 from echo_agent.plugins.hooks import HookRegistry
+from echo_agent.plugins.runtime import RuntimeExtension, RuntimeExtensionSlot
 from echo_agent.plugins.loader import (
     discover_all,
     load_plugin_module,
@@ -45,11 +46,25 @@ class PluginManager:
         self._tool_registry = tool_registry
         self._provider = provider
         self._hooks = HookRegistry()
+        self._runtime_slot = RuntimeExtensionSlot()
         self._plugins: list[PluginRecord] = []
         self._contexts: dict[str, PluginContext] = {}
         self._deactivators: dict[str, Any] = {}
         self._owned_tools: dict[str, list[Any]] = {}
         self._shutdown_lock = asyncio.Lock()
+
+    @property
+    def runtime_extension(self) -> RuntimeExtension | None:
+        """Only successfully activated plugins retain runtime policy ownership."""
+        return self._runtime_slot.extension
+
+    async def _check_required_plugins(self) -> None:
+        """Fail startup when operator-required code is absent, denied or broken."""
+        activated = {record.manifest.name for record in self._plugins if record.status == "activated"}
+        missing = set(self._config.plugins.required) - activated
+        if missing:
+            await self.shutdown()
+            raise RuntimeError("required plugin unavailable: " + ", ".join(sorted(missing)))
 
     @property
     def hooks(self) -> HookRegistry:
@@ -81,6 +96,7 @@ class PluginManager:
         plugins_cfg = self._config.plugins
         if not plugins_cfg.enabled:
             logger.info("Plugin system disabled by config")
+            await self._check_required_plugins()
             return
 
         records = discover_all(
@@ -90,6 +106,7 @@ class PluginManager:
 
         if not records:
             logger.debug("No plugins discovered")
+            await self._check_required_plugins()
             return
 
         records = self._filter_plugins(records, plugins_cfg)
@@ -115,6 +132,8 @@ class PluginManager:
                 logger.warning("Plugin '{}' skipped: {}", record.manifest.name, record.error)
                 continue
             await self._load_and_activate(record)
+
+        await self._check_required_plugins()
 
         loaded = [r for r in records if r.status == "activated"]
         failed = [r for r in records if r.status == "failed"]
@@ -239,6 +258,7 @@ class PluginManager:
             tool_registration_allowed=allow_tool_registration,
             hook_registration_allowed=allow_hook_registration,
             registration_mode=mode,
+            runtime_slot=self._runtime_slot,
         )
 
         activate_fn = interface["activate"]
@@ -398,6 +418,7 @@ class PluginManager:
         tools: list[Any] | None = None,
     ) -> None:
         """Withdraw every resource registered through a PluginContext."""
+        self._runtime_slot.release(plugin_name)
         for handler in reversed(ctx.registered_inbound_handlers):
             try:
                 self._bus.unsubscribe_inbound(handler)

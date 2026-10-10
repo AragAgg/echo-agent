@@ -32,6 +32,7 @@ _BOT_MESSAGE_TOPIC = "/v1.0/im/bot/messages/get"
 
 class DingTalkChannel(BaseChannel):
     name = "dingtalk"
+    authenticated_ingress = True
     # send_file publishes FILE/IMAGE blocks; both now reach the media API.
     supports_files = True
 
@@ -252,10 +253,12 @@ class DingTalkChannel(BaseChannel):
                     data = json.loads(msg.data)
                     headers = data.get("headers", {})
                     topic = headers.get("topic", "")
+                    # 诊断接收链路，只记录协议类型，不记录消息正文或凭据。
+                    logger.info("DingTalk stream frame: type={} topic={}", data.get("type", ""), topic)
                     ack_data = json.dumps({"response": "OK"})
                     if topic == _BOT_MESSAGE_TOPIC:
                         payload = json.loads(data.get("data", "{}"))
-                        await self._on_message(payload)
+                        await self._on_message(payload, **({'event_id': headers['messageId']} if headers.get('messageId') else {}))
                     elif data.get("type") == "SYSTEM":
                         # System pings carry opaque data that must be echoed;
                         # an empty ACK lets the server close a healthy stream.
@@ -271,14 +274,35 @@ class DingTalkChannel(BaseChannel):
                 elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                     break
 
-    async def _on_message(self, data: dict[str, Any]) -> None:
+    async def _on_message(self, data: dict[str, Any], *, event_id: str | None = None) -> None:
         sender_id = data.get("senderStaffId", data.get("senderId", ""))
         conversation_type = data.get("conversationType", "1")
+        # 私聊与群聊共用入口，接收日志用于区分身份拦截和上游未投递。
+        logger.info(
+            "DingTalk inbound: conversation_type={} msgtype={} staff_id_present={} sender_allowed={}",
+            conversation_type, data.get("msgtype", "text"),
+            bool(data.get("senderStaffId")), self.is_allowed(sender_id),
+        )
         text = ""
         media: list[dict[str, str]] = []
         msg_type = data.get("msgtype", "text")
         if msg_type == "text":
             text = data.get("text", {}).get("content", "").strip()
+        elif msg_type in ('file', 'video'):
+            # File bytes stay in the project transport; this channel only exchanges native downloadCode.
+            if not self.is_allowed(sender_id):
+                return
+            content = data.get('content', {})
+            name, code = content.get('fileName', ''), content.get('downloadCode', '')
+            if msg_type == 'video' and not name:
+                from hashlib import sha256
+                extension = str(content.get('videoType', '')).lower()
+                if extension in ('mp4', 'mov', 'm4v'):
+                    name = '钉钉视频-' + sha256(str(data.get('msgId', '')).encode()).hexdigest()[:12] + '.' + extension
+            if isinstance(name, str) and isinstance(code, str) and name and code:
+                real_url = await self._resolve_download_code(code)
+                if real_url:
+                    media.append({'type': 'file', 'url': real_url, 'name': name})
         elif msg_type == "picture":
             download_code = data.get("content", {}).get("downloadCode", "")
             if not download_code:
@@ -288,7 +312,7 @@ class DingTalkChannel(BaseChannel):
                 if real_url:
                     media.append({"type": "image", "url": real_url})
                 else:
-                    logger.warning("Failed to resolve DingTalk downloadCode: {}", download_code[:20])
+                    logger.warning("DingTalk picture download code resolution failed")
         elif msg_type == "richText":
             for item in data.get("content", {}).get("richText", []):
                 if "text" in item:
@@ -305,6 +329,7 @@ class DingTalkChannel(BaseChannel):
             media=media or None,
             metadata={"conversation_type": conversation_type},
             is_group=conversation_type == "2",
+            **({'event_id': data.get('msgId') or event_id} if data.get('msgId') or event_id else {}),
         )
 
     async def _resolve_download_code(self, download_code: str) -> str | None:
@@ -326,10 +351,9 @@ class DingTalkChannel(BaseChannel):
                     data = await resp.json()
                     return data.get("downloadUrl", "")
                 else:
-                    body = await resp.text()
-                    logger.warning("DingTalk downloadCode resolution failed ({}): {}", resp.status, body[:200])
+                    logger.warning("DingTalk download code resolution failed HTTP={}", resp.status)
         except Exception as e:
-            logger.error("DingTalk downloadCode resolution error: {}", e)
+            logger.error("DingTalk download code resolution error exception={}", type(e).__name__)
         return None
 
     async def _refresh_token(self) -> None:

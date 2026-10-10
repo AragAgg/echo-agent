@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import PurePosixPath
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator, model_validator
 from pydantic.alias_generators import to_camel
 
 from echo_agent.security.exec_env import valid_env_name
@@ -4105,6 +4105,12 @@ class A2AConfig(_Base):
 class PluginsConfig(_Base):
     """Plugin system configuration."""
 
+    required: list[str] = Field(default_factory=list, json_schema_extra={
+        "status": "effective", "ref": "plugins/manager.py:_check_required_plugins",
+        "desc_zh": "启动必需插件，缺失、禁用或加载失败时拒绝启动",
+        "desc_en": "Mandatory plugins; absent, disabled or failed plugins prevent startup",
+    })
+
     enabled: bool = Field(
         default=True,
         json_schema_extra={
@@ -4554,6 +4560,8 @@ class CostConfig(_Base):
 
 
 class Config(_Base):
+    # Program-owned policy is private: never serialize plugins or secrets into configuration.
+    _runtime_extension: object | None = PrivateAttr(default=None)
     security: SecurityConfig = Field(default_factory=SecurityConfig)
     channels: ChannelsConfig = Field(default_factory=ChannelsConfig)
     models: ModelsConfig = Field(default_factory=ModelsConfig)

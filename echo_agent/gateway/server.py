@@ -494,6 +494,10 @@ class GatewayServer:
         app.router.add_get("/meta", self._handle_meta)
         app.router.add_post(f"{prefix}/message", self._handle_message)
         app.router.add_get(f"{prefix}/health", self._handle_health)
+        from echo_agent.plugins.runtime import RuntimeExtension
+        extension = getattr(self._agent_loop, "_runtime_extension", None)
+        if isinstance(extension, RuntimeExtension):
+            extension.register_routes(app, self.auth)
         app.router.add_delete(f"{prefix}/sessions/{{key}}", self._handle_reset_session)
         # Note: GET /sessions is registered by register_management_routes when
         # _agent_loop is available; fallback registered below for standalone mode.

@@ -23,6 +23,7 @@ from echo_agent.config.schema import MCPServerConfig
 from echo_agent.mcp.client import MCPClient
 from echo_agent.mcp.security import validate_mcp_tools
 from echo_agent.mcp.tool_adapter import MCPToolAdapter
+from echo_agent.plugins.runtime import RuntimeExtension, RuntimeExtensionError
 from echo_agent.mcp.transport import StdioTransport, StreamableHttpTransport
 
 _RECONNECT_DELAYS = (1, 2, 4, 8, 16, 30, 60)
@@ -34,9 +35,11 @@ _ENV_VAR_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9
 
 class MCPManager:
 
-    def __init__(self, workspace: Path, security_policy: str = "block"):
+    def __init__(self, workspace: Path, security_policy: str = "block", *, extension: RuntimeExtension | None = None):
         self._workspace = workspace
         self._security_policy = security_policy
+        self._extension = extension
+        self._extension_errors: dict[str, RuntimeExtensionError] = {}
         self._clients: dict[str, MCPClient] = {}
         self._configs: dict[str, MCPServerConfig] = {}
         self._registered_tools: dict[str, list[str]] = {}
@@ -51,6 +54,8 @@ class MCPManager:
         # interleave with discovery or shutdown.
         self._registry_lock = asyncio.Lock()
         self._stopping = False
+        if extension is not None:
+            extension.bind_mcp_manager(self)
 
     async def start_all(self, servers: dict[str, MCPServerConfig]) -> None:
         self._stopping = False
@@ -116,6 +121,8 @@ class MCPManager:
                     continue
                 try:
                     total += await self._register_server_tools(name, client, registry)
+                except RuntimeExtensionError:
+                    raise
                 except Exception as e:
                     logger.error("Tool discovery failed for '{}': {}", name, e)
 
@@ -144,6 +151,36 @@ class MCPManager:
     @property
     def connected_servers(self) -> list[str]:
         return [name for name, client in self._clients.items() if client.is_connected]
+
+    def get_client(self, name: str) -> MCPClient | None:
+        """Program integrations resolve the live connection again after reconnects."""
+        self.assert_extension_healthy(name)
+        client = self._clients.get(name)
+        return client if client is not None and client.is_connected else None
+
+    def assert_extension_healthy(self, name: str | None = None) -> None:
+        """Block model and direct native paths after a remembered policy failure."""
+        if name is not None:
+            error = self._extension_errors.get(name)
+        else:
+            error = next(iter(self._extension_errors.values()), None)
+        if error is not None:
+            raise error
+
+    async def refresh_tools(self, name: str) -> bool:
+        """Refresh stateless project directories before a turn; no restart or SSE notification required."""
+        client, registry = self.get_client(name), self._registry
+        if client is None or registry is None:
+            return False
+        async with self._registry_lock:
+            try:
+                await self._register_server_tools(name, client, registry)
+                return True
+            except RuntimeExtensionError:
+                raise
+            except Exception as exc:
+                logger.warning('MCP directory refresh failed server={} kind={}', name, type(exc).__name__)
+                return False
 
     def health_report(self) -> dict[str, dict[str, Any]]:
         """Per-server connection state and tool count.
@@ -201,6 +238,9 @@ class MCPManager:
                 logger.info("Connected to MCP server '{}'", name)
                 return
 
+            except RuntimeExtensionError:
+                await self._safe_teardown(name, client, transport)
+                raise
             except Exception as e:
                 last_error = e
                 # Always tear down this attempt's resources before trying again.
@@ -352,6 +392,8 @@ class MCPManager:
             return False
         try:
             await self._connect_server(name, cfg)
+        except RuntimeExtensionError:
+            raise
         except Exception as e:
             logger.error("MCP server '{}' could not be reconnected: {}", name, e)
             return False
@@ -363,6 +405,8 @@ class MCPManager:
                 try:
                     count = await self._register_server_tools(name, client, registry)
                     logger.info("Re-registered {} tools for MCP server '{}'", count, name)
+                except RuntimeExtensionError:
+                    raise
                 except Exception as e:
                     logger.error("Re-discovery failed for '{}': {}", name, e)
         return True
@@ -407,6 +451,8 @@ class MCPManager:
             self._unregister_server_tools(name)
             try:
                 await self._register_server_tools(name, client, registry)
+            except RuntimeExtensionError:
+                raise
             except Exception as e:
                 logger.error("Re-discovery after list_changed failed for '{}': {}", name, e)
 
@@ -423,6 +469,14 @@ class MCPManager:
         if cfg.url:
             await self._check_url_policy(name, cfg.url)
             headers = self._resolve_env_vars(cfg.headers, name)
+            if self._extension is not None:
+                try:
+                    self._extension.configure_mcp_connection(name, cfg.url, headers)
+                except Exception as exc:
+                    failure = RuntimeExtensionError("runtime extension connection policy rejected")
+                    self._extension_errors[name] = failure
+                    self._unregister_server_tools(name)
+                    raise failure from exc
             if cfg.auth == "oauth":
                 headers["Authorization"] = f"Bearer {await self._acquire_oauth_token(name, cfg)}"
             transport = StreamableHttpTransport(url=cfg.url, headers=headers)
@@ -481,8 +535,8 @@ class MCPManager:
         # Read the registry's current names on every pass rather than caching a
         # set from start-up: a re-registration after reconnect has to see the
         # world as it is now, including tools other servers registered since.
-        # This server's own previous names are already withdrawn by the caller.
-        existing_names = set(registry.tool_names)
+        # Ignore this server's own names while validating its replacement directory.
+        existing_names = set(registry.tool_names) - set(self._registered_tools.get(name, []))
 
         accepted = validate_mcp_tools(
             server_name=name,
@@ -494,19 +548,35 @@ class MCPManager:
         )
 
         registered_names: list[str] = []
+        adapters = []
         for entry in accepted:
-            adapter = MCPToolAdapter(
-                server_name=name,
-                mcp_tool=entry.declaration,
-                client=client,
-                trust_level=cfg.trust_level if cfg else "untrusted",
-                registered_name=entry.registered_name,
-            )
+            adapter_factory = self._extension.build_mcp_adapter if self._extension else MCPToolAdapter
+            try:
+                adapter = adapter_factory(
+                    server_name=name, mcp_tool=entry.declaration, client=client,
+                    trust_level=cfg.trust_level if cfg else "untrusted",
+                    registered_name=entry.registered_name,
+                )
+            except Exception as exc:
+                if self._extension is None:
+                    raise
+                failure = RuntimeExtensionError("runtime extension adapter policy rejected")
+                self._extension_errors[name] = failure
+                self._unregister_server_tools(name)
+                raise failure from exc
+            if adapter is None:
+                continue
             if cfg:
                 adapter.timeout_seconds = cfg.timeout
-            registry.register(adapter)
+            adapters.append(adapter)
             registered_names.append(adapter.name)
 
+        # Build/validate first; the synchronous swap leaves no await-sized gap for another user.
+        self._unregister_server_tools(name)
+        for adapter in adapters:
+            registry.register(adapter)
+
+        self._extension_errors.pop(name, None)
         self._registered_tools[name] = registered_names
         logger.info(
             "Registered {} tools from MCP server '{}' (trust_level={})",

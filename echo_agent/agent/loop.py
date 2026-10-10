@@ -248,6 +248,8 @@ class AgentLoop:
         self.provider = provider
         self.router = router
         self.workspace = workspace
+        # Optional program-owned policy is installed only after plugin activation.
+        self._runtime_extension = None
         # 阶段 B(start 内 _resolve_embed_and_index)需要 storage 才能定案 backend
         # 并构造 VectorIndex/依赖它的消费者,故在此固化引用。
         self._storage = storage
@@ -535,8 +537,11 @@ class AgentLoop:
         # Retained so the REST transition endpoint can advance workflows after
         # a terminal task transition — the same closing-the-loop hook TaskTool got.
         self._workflow_engine = workflow_engine
-        self._register_tools(scheduler=scheduler, task_manager=task_manager, workflow_engine=workflow_engine)
-        self._setup_delegation()
+        # Required plugins may own tool policy; assemble native tools only after they activate.
+        self._native_tools_deferred = bool(config.plugins.required)
+        if not self._native_tools_deferred:
+            self._register_tools(scheduler=scheduler, task_manager=task_manager, workflow_engine=workflow_engine)
+            self._setup_delegation()
 
         # Pipeline stages
         self._circuit_breaker = ToolCircuitBreaker(
@@ -807,8 +812,17 @@ class AgentLoop:
 
     def set_plugin_manager(self, manager: Any) -> None:
         """Attach the plugin manager after bootstrap. Passes hook_registry to InferenceStage."""
+        from echo_agent.plugins.runtime import RuntimeExtension
+
         self._plugin_manager = manager
+        extension = manager.runtime_extension
+        self._runtime_extension = extension if isinstance(extension, RuntimeExtension) else None
+        self.config._runtime_extension = self._runtime_extension
         self._inference_stage.set_hook_registry(manager.hooks)
+        if self._native_tools_deferred:
+            self._register_tools(self._scheduler, self._task_manager, self._workflow_engine)
+            self._setup_delegation()
+            self._native_tools_deferred = False
 
     def set_evolution_engine(self, engine: Any) -> None:
         """Attach the evolution engine after bootstrap. Registers its tools and shares hooks."""
@@ -1285,6 +1299,10 @@ class AgentLoop:
             )
 
     async def start(self) -> None:
+        if self._native_tools_deferred:
+            raise RuntimeError("required plugins must be activated before starting the agent")
+        if self._runtime_extension is not None:
+            await self._runtime_extension.recover()
         # Rejections happen outside the normal inbound handler (session limiter,
         # shutdown deadline), so subscribe a dedicated lifecycle sink before the
         # bus can leave any already-accepted event without a terminal record.
@@ -1625,6 +1643,7 @@ class AgentLoop:
         self.mcp_manager = MCPManager(
             workspace=self.workspace,
             security_policy=self.config.tools.mcp_security_policy,
+            extension=getattr(self, "_runtime_extension", None),
         )
         await self.mcp_manager.start_all(mcp_servers)
         await self.mcp_manager.discover_tools(self.tools)
@@ -1733,7 +1752,8 @@ class AgentLoop:
             return
         # 群聊会话作用域解析：把按策略解析出的隔离键固化到 override，
         # 使下游全部 session_key 读取(锁/working memory/快照/可见性/source_session)统一按此键隔离。
-        scope = self.config.session.group_session_scope
+        extension = getattr(self, "_runtime_extension", None)
+        scope = (extension.session_scope if extension else None) or self.config.session.group_session_scope
         if not event.session_key_override:
             event.session_key_override = event.scoped_session_key(scope)
         # 记忆作用域(memory_scope)的冻结统一下沉到 _process_event,使 _on_inbound
@@ -1864,6 +1884,9 @@ class AgentLoop:
                         stamp_turn_outcome(out.metadata, "completed")
                     delivery = await self.bus.publish_outbound(out)
                     delivered = delivery.ok
+                    extension = getattr(self, "_runtime_extension", None)
+                    if extension is not None:
+                        await extension.record_delivery(event, delivery)
                 self.tracer.end_span(span, metadata={"response_len": len(response_text or "")})
                 # A turn that returned without raising still may not have FINISHED
                 # the task: a failed delivery, or a provider error / budget /
@@ -1872,6 +1895,9 @@ class AgentLoop:
                 # neither cron history nor the board shows an undelivered or
                 # half-done turn as done.
                 if not delivered:
+                    # IM 追问发送失败时撤销待答绑定，不能把下一条消息当作未送达问题的答案。
+                    if result.termination_reason == "awaiting_clarification":
+                        self.clarify.clear_im_pending(event.session_key)
                     await self._record_cron_outcome(event, "error", "delivery failed")
                     await self._record_task_outcome(event, "error", "delivery failed")
                     await self._mark_turn_terminal(
@@ -1958,7 +1984,11 @@ class AgentLoop:
         # 咽喉点,统一冻结可确保任何入口都拿到正确作用域。单主体下 1:1 私聊(任意通道,
         # 含 A2A/CLI)归一到 owner 键实现跨通道记忆互通,群聊保持 per_user 隔离;
         # 开关关闭时退回按会话键(旧行为)。
-        if not event.memory_scope:
+        extension = getattr(self, "_runtime_extension", None)
+        if extension is not None and extension.memory_namespace:
+            # Namespace and user identity come from program policy, never model prose.
+            event.memory_scope = f"{extension.memory_namespace}:{event.channel}:{event.sender_id}"
+        elif not event.memory_scope:
             if self.config.memory.cross_channel_owner:
                 scope = self.config.session.group_session_scope
                 event.memory_scope = event.memory_scope_key(
@@ -1990,12 +2020,21 @@ class AgentLoop:
             )
             if not claimed:
                 raise DuplicateTurnClaim(event.event_id)
-        command_response = await self._handle_approval_command(event)
+        if extension is not None and self.mcp_manager is not None:
+            # Native confirmations and attachments also precede model inference.
+            self.mcp_manager.assert_extension_healthy()
+        command_response = await extension.handle_event(event) if extension is not None else None
+        if command_response is None:
+            command_response = await self._handle_approval_command(event)
         if command_response is not None:
             session.add_message("user", event.text)
             session.add_message("assistant", command_response)
             await self.sessions.save(session)
             return _ProcessResult(response_text=command_response)
+
+        if extension is not None:
+            await extension.before_turn(self.mcp_manager)
+            self._apply_runtime_tool_policy()
 
         recorder = self.evolution.recorder if self.evolution is not None else None
         if recorder is not None and not _is_ephemeral_session(event.session_key, event.channel):
@@ -2041,9 +2080,12 @@ class AgentLoop:
             )
             if activity is not None:
                 ctx.activity = activity
-
             # Stage 2: Inference (LLM + tool execution loop)
             inference_result = await self._inference_stage.run(ctx)
+            if extension is not None:
+                presentation = await extension.presentation(event)
+                if presentation is not None:
+                    inference_result.response_text = presentation
 
             # Stage 3: Response finalization
             result = await self._response_stage.finalize(ctx, inference_result)
@@ -2208,11 +2250,9 @@ class AgentLoop:
         question = (req.question or "").strip()
         if not question:
             return
-        if req.options:
-            choices = "；".join(f"{chr(65 + i)}. {opt}" for i, opt in enumerate(req.options))
-            quoted = f"{question}\n可选项：{choices}"
-        else:
-            quoted = question
+        from echo_agent.agent.tools.clarify import ClarifyTool
+        # 复用实际投递格式，保证选项标签与用户看到的一致。
+        quoted = ClarifyTool._render_text(question, req.options)
         event.reply_to_text = quoted
         event.reply_to_is_own = True
         event.reply_to_sender = None
@@ -2337,6 +2377,9 @@ class AgentLoop:
         return _channel_matches(channel, patterns)
 
     def _should_stream_channel(self, channel: str) -> bool:
+        extension = getattr(self, "_runtime_extension", None)
+        if extension is not None and not extension.streaming_enabled:
+            return False
         return _channel_matches(channel, self.config.channels.stream_channels)
 
     def _stream_flush_params(self, channel: str) -> tuple[int, int, bool]:

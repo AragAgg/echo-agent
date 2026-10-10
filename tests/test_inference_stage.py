@@ -12,6 +12,61 @@ from echo_agent.models.provider import LLMResponse, ToolCallRequest
 from echo_agent.tools import ToolResult
 
 
+# /***********************************************************
+#  *                     IM 追问等待状态                      *
+# /***********************************************************/
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("valid", [True, False])
+async def test_im_question_only_stops_after_success_and_keeps_plan_open(valid):
+    """成功提问不重规划也不宣称任务完成；参数错误允许模型继续纠正。"""
+    from echo_agent.agent.clarify_manager import ClarifyManager
+    from echo_agent.agent.tools.clarify import ClarifyTool
+    from echo_agent.agent.tools.registry import ToolRegistry
+    from echo_agent.agent.planning.models import Plan, PlanStep, StepStatus, StrategyType
+    manager = ClarifyManager()
+    registry = ToolRegistry()
+    registry.register(ClarifyTool(manager))
+    provider = AsyncMock()
+    provider.chat_stream_with_retry = AsyncMock(side_effect=[
+        LLMResponse(content="先确定范围。", finish_reason="tool_calls", tool_calls=[
+            ToolCallRequest(id="question", name="clarify", arguments={
+                "question": "选哪一项？", "options": ["甲", "乙"] if valid else '["甲","乙"]',
+            }),
+        ]),
+        LLMResponse(content="请直接说明筛选条件。", finish_reason="stop"),
+    ])
+    planner = MagicMock()
+    planner.reflect = AsyncMock(return_value=None)
+    stage, _ = _make_stage(provider=provider, tools=registry, planner=planner)
+    stage._clarify = manager
+    stage._plan_run_store = MagicMock()
+    stage._plan_run_store.update = AsyncMock()
+    event = _make_event()
+    event.channel = "dingtalk"
+    session = _make_session()
+    session.metadata = {}
+    ctx = _make_ctx(event=event, session=session, tool_defs=[{"function": {"name": "clarify"}}])
+    ctx.execution_plan = Plan(strategy=StrategyType.PLAN_EXECUTE, steps=[
+        PlanStep(index=0, description="查询后问范围", tool_hint="clarify"),
+        PlanStep(index=1, description="按用户选择查询", tool_hint="search"),
+    ])
+    ctx.plan_run_id = "question-plan"
+    result = await stage.run(ctx)
+    if valid:
+        assert "A. 甲" in result.response_text and "B. 乙" in result.response_text
+        assert result.task_incomplete and result.termination_reason == "awaiting_clarification"
+        assert provider.chat_stream_with_retry.await_count == 1
+        planner.reflect.assert_not_awaited()
+        assert stage._plan_run_store.update.await_args.kwargs["status"] == "running"
+        assert ctx.execution_plan.steps[1].status == StepStatus.PENDING
+    else:
+        assert result.response_text == "请直接说明筛选条件。"
+        assert provider.chat_stream_with_retry.await_count == 2
+        assert manager.take_im_pending(event.session_key, ttl_seconds=300) is None
+
+
+
 def _make_config():
     config = MagicMock()
     config.skills = MagicMock()
