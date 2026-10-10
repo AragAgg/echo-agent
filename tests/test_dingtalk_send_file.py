@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import asyncio
+import re
 from unittest.mock import AsyncMock, MagicMock
 
 import aiohttp
@@ -19,7 +20,7 @@ from echo_agent.config.schema import DingTalkChannelConfig
 
 
 @pytest_asyncio.fixture
-async def transport(monkeypatch):
+async def transport(monkeypatch, tmp_path):
     """Replace only DingTalk's remote endpoints; retain the real channel and bus."""
     calls = []
     replies = {
@@ -47,9 +48,13 @@ async def transport(monkeypatch):
             if request.path == "/v1.0/gateway/connections/open":
                 action = "gateway"
             record["payload"] = await request.json()
+            record["body_bytes"] = len(await request.read())
             record["token"] = request.headers.get("x-acs-dingtalk-access-token")
         calls.append(record)
         reply = replies[action]
+        if isinstance(reply, list):
+            status, reply = reply.pop(0)
+            return web.json_response(reply, status=status)
         if isinstance(reply, str):
             return web.Response(text=reply, status=statuses[action])
         return web.json_response(reply, status=statuses[action])
@@ -64,6 +69,12 @@ async def transport(monkeypatch):
     monkeypatch.setattr(dingtalk, "_API_BASE", base)
     monkeypatch.setattr(dingtalk, "_OAPI_BASE", base)
     bus = MessageBus()
+    from echo_agent.agent.turn_run_store import TurnRunStore
+    from echo_agent.storage.sqlite import SQLiteBackend
+    backend = SQLiteBackend(tmp_path / "delivery.db")
+    await backend.initialize()
+    bus.set_turn_run_store(TurnRunStore(backend))
+    monkeypatch.setattr(dingtalk, "_TEXT_SEND_INTERVAL", 0, raising=False)
     channel = dingtalk.DingTalkChannel(DingTalkChannelConfig(
         app_key="test-key", app_secret="test-secret", robot_code="test-robot",
     ), bus)
@@ -74,6 +85,106 @@ async def transport(monkeypatch):
             yield channel, bus, calls, replies, statuses
         finally:
             await runner.cleanup()
+            await backend.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("chat_id", ["staff123", "cidTest=="])
+@pytest.mark.parametrize("body", ["A" * 32054, ('中文🙂\\\"\n' * 4000)], ids=["ascii", "unicode-escaped"])
+async def test_long_reply_preserves_content_and_bounds_encoded_template(transport, chat_id, body):
+    channel, bus, calls, _, _ = transport
+    event = OutboundEvent.text_reply(channel="dingtalk", chat_id=chat_id, text=body)
+    receipt = await bus.publish_outbound(event)
+    sends = [call["payload"] for call in calls if "payload" in call]
+    assert len(sends) > 1
+    chunks = [json.loads(payload["msgParam"])["content"] for payload in sends]
+    assert all(len(payload["msgParam"].encode()) <= 15000 for payload in sends)
+    assert all(len(json.dumps(payload["msgParam"], ensure_ascii=False).encode()) <= 15000 for payload in sends)
+    assert all(call["body_bytes"] <= 16000 for call in calls if "payload" in call)
+    assert ''.join(re.sub(r'^【第\d+/\d+段】\n', '', chunk) for chunk in chunks) == body
+    assert all(chunk.startswith(f'【第{index}/{len(chunks)}段】\n') for index, chunk in enumerate(chunks, 1))
+    assert receipt.stage.value == "delivered"
+    assert len(receipt.detail["message_ids"]) == len(chunks)
+
+
+@pytest.mark.asyncio
+async def test_partial_rejection_resumes_unsent_parts_after_channel_restart(transport):
+    channel, bus, calls, replies, _ = transport
+    event = OutboundEvent.text_reply(channel="dingtalk", chat_id="staff123", text="A" * 32054)
+    replies["send"] = [(200, {"processQueryKey": "first"}),
+                       (429, {"code": "Throttling", "message": "retry later"})]
+    failed = await bus.publish_outbound(event)
+    assert failed.stage.value == "failed"
+    assert failed.detail["message_ids"] == ["first"]
+    assert len([call for call in calls if "payload" in call]) == 2
+    restarted = dingtalk.DingTalkChannel(channel.config, bus)
+    restarted._session = channel._session
+    replies["send"] = [(200, {"processQueryKey": "second"}), (200, {"processQueryKey": "third"})]
+    result = await restarted.send(event)
+    assert result.success
+    assert result.message_ids == ["first", "second", "third"]
+    sends = [json.loads(call["payload"]["msgParam"])["content"] for call in calls if "payload" in call]
+    assert sends[1] == sends[2] and sends[0] not in sends[2:]
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_partial_send_does_not_replay_or_claim_delivery(transport):
+    channel, _, calls, replies, _ = transport
+    event = OutboundEvent.text_reply(channel="dingtalk", chat_id="staff123", text="A" * 32054)
+    replies["send"] = [(200, {"processQueryKey": "first"}), (200, {})]
+    result = await channel.send(event)
+    assert not result.success
+    count = len(calls)
+    result = await channel.send(event)
+    assert not result.success and "unknown" in result.error
+    assert len(calls) == count
+
+
+@pytest.mark.asyncio
+async def test_http_server_failure_is_ambiguous_and_never_automatically_replayed(transport):
+    channel, _, calls, replies, _ = transport
+    event = OutboundEvent.text_reply(channel="dingtalk", chat_id="staff123", text="A" * 32054)
+    replies["send"] = [(200, {"processQueryKey": "first"}), (500, {"code": "InternalError"})]
+    assert not (await channel.send(event)).success
+    count = len(calls)
+    assert "unknown" in (await channel.send(event)).error
+    assert len(calls) == count
+
+
+@pytest.mark.asyncio
+async def test_timeout_keeps_unknown_checkpoint(transport, monkeypatch):
+    channel, _, calls, _, _ = transport
+    event = OutboundEvent.text_reply(channel="dingtalk", chat_id="staff123", text="A" * 32054)
+    original = channel._send_message
+    attempts = 0
+
+    async def send(event, key, param):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 2:
+            raise asyncio.TimeoutError()
+        return await original(event, key, param)
+
+    monkeypatch.setattr(channel, "_send_message", send)
+    assert not (await channel.send(event)).success
+    count = len(calls)
+    assert "unknown" in (await channel.send(event)).error
+    assert attempts == 2 and len(calls) == count
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("replacement", ["B" * 32054, "short changed reply"], ids=["long", "short"])
+async def test_retry_cannot_change_long_reply_under_same_identity(transport, replacement):
+    channel, _, calls, replies, _ = transport
+    event = OutboundEvent.text_reply(channel="dingtalk", chat_id="staff123", text="A" * 32054)
+    replies["send"] = [(200, {"processQueryKey": "first"}), (400, {"code": "InvalidmsgParam"})]
+    assert not (await channel.send(event)).success
+    count = len(calls)
+    changed = OutboundEvent.text_reply(channel="dingtalk", chat_id="staff123", text=replacement)
+    changed.event_id = event.event_id
+    result = await channel.send(changed)
+    assert not result.success and "conflict" in result.error
+    assert len(calls) == count
 
 
 @pytest.mark.asyncio

@@ -116,6 +116,23 @@ def _manager(bus: MessageBus, channel: _FakeChannel) -> ChannelManager:
     return cm
 
 
+@pytest.mark.asyncio
+async def test_final_retry_preserves_outbound_identity():
+    bus, channel = MessageBus(), _FakeChannel()
+    manager = _manager(bus, channel)
+    event = OutboundEvent.text_reply(channel=channel.name, chat_id="room", text="long reply")
+    identities = []
+
+    async def send(outbound):
+        identities.append(outbound.event_id)
+        return SendResult(success=len(identities) > 1, message_id="receipt")
+
+    channel.send = send
+    assert not (await manager._deliver_final(event)).success
+    assert (await manager._deliver_final(event)).success
+    assert identities == [event.event_id, event.event_id]
+
+
 def _ctx(chat_id: str = "room1") -> ToolExecutionContext:
     return ToolExecutionContext(
         inbound_event_id=TURN, channel="weixin", chat_id=chat_id,

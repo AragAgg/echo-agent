@@ -52,10 +52,14 @@ class DeliveryResult:
             return cls(DeliveryStage.ACCEPTED, channel, detail=detail)
         if sr.success:
             detail = {"message_id": sr.message_id}
+            if sr.message_ids:
+                detail["message_ids"] = list(sr.message_ids)
             if sr.deferred:
                 detail["deferred"] = True
             return cls(DeliveryStage.DELIVERED, channel, detail=detail)
         detail = {"deferred": True} if sr.deferred else {}
+        if sr.message_ids:
+            detail["message_ids"] = list(sr.message_ids)
         return cls(
             DeliveryStage.FAILED,
             channel,

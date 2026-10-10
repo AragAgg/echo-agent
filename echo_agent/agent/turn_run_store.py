@@ -27,6 +27,7 @@ class TurnRunStore:
     _MAX_RUNS_PER_SESSION = 500
     _IDEMPOTENCY_TTL_SECONDS = 3600.0
     _MAX_IDEMPOTENCY_RECORDS = 100_000
+    _MAX_OUTBOUND_PARTS = 100_000
 
     def __init__(
         self,
@@ -43,6 +44,45 @@ class TurnRunStore:
         sink: Callable[[str, dict[str, Any]], Awaitable[None]] | None,
     ) -> None:
         self._event_sink = sink
+
+    async def get_outbound_part(self, part_id: str) -> dict[str, Any] | None:
+        rows = await self._storage.fetch_sql("SELECT * FROM outbound_parts WHERE part_id=?", (part_id,))
+        return dict(rows[0]) if rows else None
+
+    async def claim_outbound_part(self, part_id: str, fingerprint: str) -> dict[str, Any]:
+        """Reserve before sending; an empty receipt remains ambiguous after a crash.
+
+        Never evict delivery identities to make space: that would replay an
+        acknowledged or uncertain send. Only a definite rejection is releasable.
+        """
+        changed = await self._storage.execute_sql(
+            "INSERT INTO outbound_parts(part_id,fingerprint) SELECT ?,? "
+            "WHERE (SELECT COUNT(*) FROM outbound_parts) < ? "
+            "ON CONFLICT(part_id) DO NOTHING",
+            (part_id, fingerprint, self._MAX_OUTBOUND_PARTS),
+        )
+        if changed is None:
+            raise RuntimeError("outbound storage cannot arbitrate delivery")
+        row = await self.get_outbound_part(part_id)
+        if row is None:
+            raise RuntimeError("outbound delivery ledger is full")
+        if row["fingerprint"] != fingerprint:
+            raise RuntimeError("outbound delivery identity conflict")
+        return {**row, "new": changed == 1}
+
+    async def finish_outbound_part(self, part_id: str, message_id: str | None) -> None:
+        """Persist a platform receipt, or release a definitively rejected request."""
+        if message_id is None:
+            await self._storage.execute_sql(
+                "DELETE FROM outbound_parts WHERE part_id=? AND message_id=''", (part_id,),
+            )
+        else:
+            changed = await self._storage.execute_sql(
+                "UPDATE outbound_parts SET message_id=? WHERE part_id=? AND message_id=''",
+                (message_id, part_id),
+            )
+            if changed != 1:
+                raise RuntimeError("outbound receipt was not persisted")
 
     async def _emit(self, event_id: str) -> None:
         if self._event_sink is None:

@@ -302,6 +302,14 @@ _MIGRATIONS: list[tuple[int, str]] = [
         PRIMARY KEY (window_date, skill)
     )""",
     ),
+    (
+        35,
+        """CREATE TABLE IF NOT EXISTS outbound_parts (
+        part_id TEXT PRIMARY KEY,
+        fingerprint TEXT NOT NULL,
+        message_id TEXT NOT NULL DEFAULT ''
+    )""",
+    ),
 ]
 
 

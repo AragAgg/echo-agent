@@ -13,6 +13,39 @@ from echo_agent.storage.sqlite import SQLiteBackend
 
 
 @pytest.mark.asyncio
+async def test_outbound_parts_survive_reopen_and_concurrent_claims(tmp_path: Path):
+    path = tmp_path / "parts.db"
+    backend = SQLiteBackend(path)
+    await backend.initialize()
+    store = TurnRunStore(backend)
+    try:
+        claims = await asyncio.gather(*(store.claim_outbound_part("part-1", "frozen") for _ in range(8)))
+        assert sum(row["new"] for row in claims) == 1
+        await store.finish_outbound_part("part-1", "platform-receipt")
+        await store.claim_outbound_part("part-2", "frozen")
+        await store.claim_outbound_part("rejected", "frozen")
+        await store.finish_outbound_part("rejected", None)
+    finally:
+        await backend.close()
+    reopened = SQLiteBackend(path)
+    await reopened.initialize()
+    try:
+        restarted = TurnRunStore(reopened)
+        assert (await restarted.claim_outbound_part("part-1", "frozen"))["message_id"] == "platform-receipt"
+        unknown = await restarted.claim_outbound_part("part-2", "frozen")
+        assert not unknown["new"] and not unknown["message_id"]
+        assert (await restarted.claim_outbound_part("rejected", "frozen"))["new"]
+        with pytest.raises(RuntimeError, match="conflict"):
+            await restarted.claim_outbound_part("part-1", "changed")
+        restarted._MAX_OUTBOUND_PARTS = 3
+        with pytest.raises(RuntimeError, match="full"):
+            await restarted.claim_outbound_part("overflow", "frozen")
+        assert (await restarted.claim_outbound_part("part-1", "frozen"))["message_id"] == "platform-receipt"
+    finally:
+        await reopened.close()
+
+
+@pytest.mark.asyncio
 async def test_turn_lifecycle_is_durable_and_terminal_is_monotonic(tmp_path: Path):
     backend = SQLiteBackend(tmp_path / "turns.db")
     await backend.initialize()

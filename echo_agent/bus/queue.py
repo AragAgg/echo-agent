@@ -80,6 +80,22 @@ class MessageBus:
             return None
         return await store.get(event_id)
 
+    async def get_outbound_part(self, part_id: str) -> dict | None:
+        if self._turn_run_store is None:
+            return None
+        return await self._turn_run_store.get_outbound_part(part_id)
+
+    async def claim_outbound_part(self, part_id: str, fingerprint: str) -> dict:
+        """Long replies require restart-safe delivery checkpoints."""
+        if self._turn_run_store is None:
+            raise RuntimeError("durable outbound storage is unavailable")
+        return await self._turn_run_store.claim_outbound_part(part_id, fingerprint)
+
+    async def finish_outbound_part(self, part_id: str, message_id: str | None) -> None:
+        if self._turn_run_store is None:
+            raise RuntimeError("durable outbound storage is unavailable")
+        await self._turn_run_store.finish_outbound_part(part_id, message_id)
+
     async def release_turn_acceptance(self, event_id: str, session_key: str) -> bool | None:
         store = self._turn_run_store
         if store is None:

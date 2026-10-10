@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import mimetypes
 import time
@@ -28,6 +29,45 @@ _IMAGE_TYPES = frozenset({"jpg", "gif", "png", "bmp"})
 _SEND_TIMEOUT = aiohttp.ClientTimeout(total=30)
 _UPLOAD_TIMEOUT = aiohttp.ClientTimeout(total=120)
 _BOT_MESSAGE_TOPIC = "/v1.0/im/bot/messages/get"
+# Conservative template budget verified against this robot's sampleText API;
+# not an assertion that DingTalk measures its advertised limit as raw UTF-8.
+_MAX_TEXT_PARAM_BYTES = 15_000
+_TEXT_HEADER_RESERVE = 64
+_TEXT_SEND_INTERVAL = 3.0
+
+
+class _MessageRejected(RuntimeError):
+    """The platform explicitly refused the message, so a retry is safe."""
+
+
+def _text_parts(text: str) -> list[str]:
+    """Bound escaped template bytes, preferring paragraphs without losing whitespace."""
+    def size(value: str) -> int:
+        # msgParam is itself a JSON string in the robot request. Count the
+        # second escaping layer too, especially quotes, slashes and newlines.
+        param = json.dumps({"content": value}, ensure_ascii=False)
+        return len(json.dumps(param, ensure_ascii=False).encode("utf-8"))
+
+    if size(text) <= _MAX_TEXT_PARAM_BYTES:
+        return [text]
+    chunks: list[str] = []
+    start = 0
+    while start < len(text):
+        low, high = start + 1, len(text)
+        while low < high:
+            middle = (low + high + 1) // 2
+            if size(text[start:middle]) <= _MAX_TEXT_PARAM_BYTES - _TEXT_HEADER_RESERVE:
+                low = middle
+            else:
+                high = middle - 1
+        end = low
+        if end < len(text):
+            boundary = text.rfind('\n', start, end)
+            if boundary >= start + (end - start) // 2:
+                end = boundary + 1
+        chunks.append(text[start:end])
+        start = end
+    return [f'【第{index}/{len(chunks)}段】\n{chunk}' for index, chunk in enumerate(chunks, 1)]
 
 
 class DingTalkChannel(BaseChannel):
@@ -46,6 +86,8 @@ class DingTalkChannel(BaseChannel):
         self._token_expires: float = 0
         self._poll_task: asyncio.Task | None = None
         self._rate_limited_until: float = 0
+        self._text_send_lock = asyncio.Lock()
+        self._last_text_send: float = 0
 
     async def start(self) -> None:
         self._session = aiohttp.ClientSession()
@@ -82,6 +124,7 @@ class DingTalkChannel(BaseChannel):
             return SendResult(success=False, error="DingTalk send: no session")
         if not text and not attachments:
             return SendResult(success=False, error="DingTalk send: no text or files")
+        message_ids: list[str] = []
         try:
             # Preflight every attachment before posting even the caption. Reads
             # are bounded and run off the event loop to keep Stream responsive.
@@ -91,7 +134,41 @@ class DingTalkChannel(BaseChannel):
                 raise RuntimeError("DingTalk send: access token refresh failed")
             result = SendResult(success=True)
             if text:
-                result = await self._send_message(event, "sampleText", {"content": text})
+                parts = _text_parts(text)
+                logger.debug("DingTalk text: characters={} utf8_bytes={} parts={}",
+                             len(text), len(text.encode("utf-8")), len(parts))
+                # Keep concurrent replies from interleaving their numbered parts.
+                async with self._text_send_lock:
+                    checkpointed = len(parts) > 1 or await self.bus.get_outbound_part(
+                        f"dingtalk:{event.event_id}:0",
+                    ) is not None
+                    fingerprint = hashlib.sha256(json.dumps(
+                        [self._robot_code, event.chat_id, str(event.metadata.get("conversation_type", "")), parts],
+                        ensure_ascii=False,
+                    ).encode()).hexdigest()
+                    for index, part in enumerate(parts):
+                        part_id = f"dingtalk:{event.event_id}:{index}"
+                        if checkpointed:
+                            checkpoint = await self.bus.claim_outbound_part(part_id, fingerprint)
+                            if checkpoint["message_id"]:
+                                message_ids.append(checkpoint["message_id"])
+                                continue
+                            if not checkpoint["new"]:
+                                raise RuntimeError("DingTalk send: delivery unknown; automatic replay withheld")
+                        try:
+                            delay = self._last_text_send + _TEXT_SEND_INTERVAL - time.monotonic()
+                            if delay > 0:
+                                await asyncio.sleep(delay)
+                            self._last_text_send = time.monotonic()
+                            result = await self._send_message(event, "sampleText", {"content": part})
+                        except _MessageRejected:
+                            if checkpointed:
+                                await self.bus.finish_outbound_part(part_id, None)
+                            raise
+                        if checkpointed:
+                            await self.bus.finish_outbound_part(part_id, result.message_id)
+                        message_ids.append(result.message_id)
+                result = SendResult(success=True, message_id=message_ids[-1], message_ids=message_ids)
             for name, file_type, media_type, data in files:
                 media_id = await self._upload_media(name, media_type, data)
                 if media_type == "image":
@@ -100,6 +177,8 @@ class DingTalkChannel(BaseChannel):
                     result = await self._send_message(event, "sampleFile", {
                         "mediaId": media_id, "fileName": name, "fileType": file_type,
                     })
+                message_ids.append(result.message_id)
+            result.message_ids = list(message_ids)
             return result
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
             # aiohttp exceptions can contain the upload URL's access_token.
@@ -110,7 +189,7 @@ class DingTalkChannel(BaseChannel):
             if secret:
                 error = error.replace(secret, "[redacted]")
         logger.warning("DingTalk send failed: {}", error)
-        return SendResult(success=False, error=error)
+        return SendResult(success=False, error=error, message_ids=message_ids)
 
     @staticmethod
     def _read_attachment(block: ContentBlock) -> tuple[str, str, str, bytes]:
@@ -167,13 +246,16 @@ class DingTalkChannel(BaseChannel):
             url = f"{_API_BASE}/v1.0/robot/groupMessages/send"
             payload.pop("userIds")
             payload["openConversationId"] = event.chat_id
-        headers = {"x-acs-dingtalk-access-token": self._access_token}
-        async with self._session.post(url, json=payload, headers=headers, timeout=_SEND_TIMEOUT) as resp:
+        headers = {"x-acs-dingtalk-access-token": self._access_token, "Content-Type": "application/json"}
+        # Match the splitter's UTF-8 encoding instead of aiohttp's default
+        # ASCII escaping, which expands Chinese/Emoji and changes the budget.
+        body_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        async with self._session.post(url, data=body_bytes, headers=headers, timeout=_SEND_TIMEOUT) as resp:
             body = await self._read_api_response(resp, "message")
         # batchSend can accept the request yet reject this particular recipient.
         for field in ("invalidStaffIdList", "flowControlledStaffIdList"):
             if body.get(field):
-                raise RuntimeError(f"DingTalk message: recipient rejected ({field})")
+                raise _MessageRejected(f"DingTalk message: recipient rejected ({field})")
         message_id = body.get("processQueryKey")
         if not isinstance(message_id, str) or not message_id:
             raise RuntimeError("DingTalk message: missing processQueryKey")
@@ -193,7 +275,8 @@ class DingTalkChannel(BaseChannel):
         code = body.get("errcode", body.get("code", 0))
         if resp.status >= 400 or code not in (0, "0", None):
             detail = str(body.get("errmsg", body.get("message", "")))[:200]
-            raise RuntimeError(f"DingTalk {action}: HTTP {resp.status}, code={code}: {detail}")
+            error_type = _MessageRejected if action == "message" and resp.status in (400, 401, 403, 404, 413, 422, 429) else RuntimeError
+            raise error_type(f"DingTalk {action}: HTTP {resp.status}, code={code}: {detail}")
         return body
 
     async def _callback_register_and_poll(self) -> None:

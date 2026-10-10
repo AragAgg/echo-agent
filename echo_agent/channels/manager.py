@@ -385,6 +385,7 @@ class ChannelManager:
                     # fall through to a fresh send on edit exception
 
         send_event = OutboundEvent(
+            event_id=event.event_id,
             channel=event.channel,
             chat_id=event.chat_id,
             content=list(event.content),

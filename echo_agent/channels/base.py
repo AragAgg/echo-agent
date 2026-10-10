@@ -6,7 +6,7 @@ import hashlib
 import inspect
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
@@ -29,6 +29,8 @@ class SendResult:
     # remote recipient. Multipart callers can continue while withholding their
     # durable delivery checkpoint until a non-deferred receipt is available.
     deferred: bool = False
+    # Multipart receipts include acknowledged parts even when a later part fails.
+    message_ids: list[str] = field(default_factory=list)
 
 
 class BaseChannel(ABC):
