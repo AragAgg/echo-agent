@@ -57,7 +57,7 @@ class _QuestionProvider(_StubProvider):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("options", [["按平台筛选", "按热度排序"], ["A. 按平台筛选", "B. 按热度排序"],
-                                     ["A 按平台筛选", "B 按热度排序"], []])
+                                     []])
 @pytest.mark.parametrize("delivery_success", [True, False])
 async def test_dingtalk_clarify_reaches_outbound_with_answer_and_options(tmp_path, options, delivery_success):
     """真实 AgentLoop 出站必须带上解释、问题和选项，不能只投递已发送宣称。"""

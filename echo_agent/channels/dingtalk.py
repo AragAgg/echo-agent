@@ -15,7 +15,7 @@ from loguru import logger
 
 from echo_agent.bus.events import ContentBlock, ContentType, OutboundEvent
 from echo_agent.bus.queue import MessageBus
-from echo_agent.channels.base import BaseChannel, SendResult
+from echo_agent.channels.base import BaseChannel, SendResult, DeliveryRejected
 from echo_agent.config.schema import DingTalkChannelConfig
 
 _API_BASE = "https://api.dingtalk.com"
@@ -36,8 +36,7 @@ _TEXT_HEADER_RESERVE = 64
 _TEXT_SEND_INTERVAL = 3.0
 
 
-class _MessageRejected(RuntimeError):
-    """The platform explicitly refused the message, so a retry is safe."""
+_MessageRejected = DeliveryRejected
 
 
 def _text_parts(text: str) -> list[str]:
@@ -125,6 +124,7 @@ class DingTalkChannel(BaseChannel):
         if not text and not attachments:
             return SendResult(success=False, error="DingTalk send: no text or files")
         message_ids: list[str] = []
+        delivery_unknown = False
         try:
             # Preflight every attachment before posting even the caption. Reads
             # are bounded and run off the event loop to keep Stream responsive.
@@ -137,59 +137,65 @@ class DingTalkChannel(BaseChannel):
                 parts = _text_parts(text)
                 logger.debug("DingTalk text: characters={} utf8_bytes={} parts={}",
                              len(text), len(text.encode("utf-8")), len(parts))
-                # Keep concurrent replies from interleaving their numbered parts.
-                async with self._text_send_lock:
-                    checkpointed = len(parts) > 1 or await self.bus.get_outbound_part(
-                        f"dingtalk:{event.event_id}:0",
-                    ) is not None
-                    fingerprint = hashlib.sha256(json.dumps(
-                        [self._robot_code, event.chat_id, str(event.metadata.get("conversation_type", "")), parts],
-                        ensure_ascii=False,
-                    ).encode()).hexdigest()
-                    for index, part in enumerate(parts):
-                        part_id = f"dingtalk:{event.event_id}:{index}"
-                        if checkpointed:
-                            checkpoint = await self.bus.claim_outbound_part(part_id, fingerprint)
-                            if checkpoint["message_id"]:
-                                message_ids.append(checkpoint["message_id"])
-                                continue
-                            if not checkpoint["new"]:
-                                raise RuntimeError("DingTalk send: delivery unknown; automatic replay withheld")
-                        try:
-                            delay = self._last_text_send + _TEXT_SEND_INTERVAL - time.monotonic()
-                            if delay > 0:
-                                await asyncio.sleep(delay)
-                            self._last_text_send = time.monotonic()
-                            result = await self._send_message(event, "sampleText", {"content": part})
-                        except _MessageRejected:
-                            if checkpointed:
-                                await self.bus.finish_outbound_part(part_id, None)
-                            raise
-                        if checkpointed:
-                            await self.bus.finish_outbound_part(part_id, result.message_id)
-                        message_ids.append(result.message_id)
-                result = SendResult(success=True, message_id=message_ids[-1], message_ids=message_ids)
-            for name, file_type, media_type, data in files:
-                media_id = await self._upload_media(name, media_type, data)
+                fingerprint = hashlib.sha256(json.dumps(
+                    [self._robot_code, event.chat_id, str(event.metadata.get("conversation_type", "")), parts],
+                    ensure_ascii=False,
+                ).encode()).hexdigest()
+
+                async def before_send(index, part):
+                    async with self._text_send_lock:
+                        delay = self._last_text_send + _TEXT_SEND_INTERVAL - time.monotonic()
+                        if delay > 0:
+                            await asyncio.sleep(delay)
+                        await self._ensure_token()
+                        self._last_text_send = time.monotonic()
+
+                async def send_part(index, part):
+                    return await self._send_message(event, "sampleText", {"content": part})
+
+                result = await self.send_parts(event, parts, send_part, fingerprint=fingerprint,
+                                               before_send=before_send, require_durable=True,
+                                               force_checkpoint=bool(files))
+                message_ids.extend(result.message_ids)
+                if not result.success:
+                    delivery_unknown = result.delivery_unknown
+                    # Use the common redaction path for transport/server error messages.
+                    raise RuntimeError(result.error)
+            async def send_media(index, part):
+                name, file_type, media_type, data = files[index]
+                try:
+                    media_id = await self._upload_media(name, media_type, data)
+                except Exception as exc:
+                    # An upload alone cannot deliver a robot message; retrying it is safe.
+                    raise _MessageRejected(str(exc)) from exc
                 if media_type == "image":
-                    result = await self._send_message(event, "sampleImageMsg", {"photoURL": media_id})
-                else:
-                    result = await self._send_message(event, "sampleFile", {
-                        "mediaId": media_id, "fileName": name, "fileType": file_type,
-                    })
-                message_ids.append(result.message_id)
+                    return await self._send_message(event, "sampleImageMsg", {"photoURL": media_id})
+                return await self._send_message(event, "sampleFile", {
+                    "mediaId": media_id, "fileName": name, "fileType": file_type,
+                })
+            if files:
+                identities = [json.dumps([name, file_type, media_type, hashlib.sha256(data).hexdigest()])
+                              for name, file_type, media_type, data in files]
+                media_result = await self.send_parts(event, identities, send_media, namespace="media",
+                                                     force_checkpoint=True)
+                message_ids.extend(media_result.message_ids)
+                if not media_result.success:
+                    delivery_unknown = media_result.delivery_unknown
+                    raise RuntimeError(media_result.error)
+                result = media_result
             result.message_ids = list(message_ids)
             return result
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
             # aiohttp exceptions can contain the upload URL's access_token.
             error = f"DingTalk send: network failure ({type(exc).__name__})"
+            delivery_unknown = True
         except (OSError, ValueError, RuntimeError) as exc:
             error = str(exc)
         for secret in (self._access_token, self._app_key, self._app_secret):
             if secret:
                 error = error.replace(secret, "[redacted]")
         logger.warning("DingTalk send failed: {}", error)
-        return SendResult(success=False, error=error, message_ids=message_ids)
+        return SendResult(success=False, error=error, message_ids=message_ids, delivery_unknown=delivery_unknown)
 
     @staticmethod
     def _read_attachment(block: ContentBlock) -> tuple[str, str, str, bytes]:
@@ -201,8 +207,11 @@ class DingTalkChannel(BaseChannel):
             raise ValueError("DingTalk attachment must be a regular file")
         name = path.name
         file_type = path.suffix.lstrip(".").lower()
-        media_type = "image" if file_type in _IMAGE_TYPES else "file"
-        if file_type not in _FILE_TYPES | _IMAGE_TYPES:
+        if file_type == "jpeg":
+            file_type = "jpg"
+        media_type = "image" if block.type == ContentType.IMAGE else "file"
+        allowed_types = _IMAGE_TYPES if media_type == "image" else _FILE_TYPES
+        if file_type not in allowed_types:
             raise ValueError(f"DingTalk unsupported file type: {file_type or '(none)'}; use a ZIP archive")
         if path.stat().st_size > _MAX_FILE_BYTES:
             raise ValueError("DingTalk file exceeds 20 MB limit")
@@ -268,14 +277,17 @@ class DingTalkChannel(BaseChannel):
             body = await resp.json()
         except (ValueError, aiohttp.ContentTypeError) as exc:
             if resp.status >= 400:
-                raise RuntimeError(f"DingTalk {action}: HTTP {resp.status}: {(await resp.text())[:200]}") from exc
+                error_type = _MessageRejected if action == "message" and 400 <= resp.status < 500 else RuntimeError
+                raise error_type(f"DingTalk {action}: HTTP {resp.status}: {(await resp.text())[:200]}") from exc
             raise RuntimeError(f"DingTalk {action}: invalid JSON response") from exc
         if not isinstance(body, dict):
+            if action == "message" and 400 <= resp.status < 500:
+                raise _MessageRejected(f"DingTalk {action}: HTTP {resp.status}")
             raise RuntimeError(f"DingTalk {action}: invalid JSON object")
         code = body.get("errcode", body.get("code", 0))
         if resp.status >= 400 or code not in (0, "0", None):
             detail = str(body.get("errmsg", body.get("message", "")))[:200]
-            error_type = _MessageRejected if action == "message" and resp.status in (400, 401, 403, 404, 413, 422, 429) else RuntimeError
+            error_type = _MessageRejected if action == "message" and (400 <= resp.status < 500 or resp.status < 400) else RuntimeError
             raise error_type(f"DingTalk {action}: HTTP {resp.status}, code={code}: {detail}")
         return body
 
@@ -331,35 +343,61 @@ class DingTalkChannel(BaseChannel):
         ws_url = f"{endpoint}?ticket={ticket}"
         async with self._session.ws_connect(ws_url) as ws:
             logger.info("DingTalk stream connected")
-            async for msg in ws:
-                if msg.type == aiohttp.WSMsgType.TEXT:
-                    data = json.loads(msg.data)
-                    headers = data.get("headers", {})
-                    topic = headers.get("topic", "")
-                    # 诊断接收链路，只记录协议类型，不记录消息正文或凭据。
-                    logger.info("DingTalk stream frame: type={} topic={}", data.get("type", ""), topic)
-                    ack_data = json.dumps({"response": "OK"})
-                    if topic == _BOT_MESSAGE_TOPIC:
-                        payload = json.loads(data.get("data", "{}"))
-                        await self._on_message(payload, **({'event_id': headers['messageId']} if headers.get('messageId') else {}))
-                    elif data.get("type") == "SYSTEM":
-                        # System pings carry opaque data that must be echoed;
-                        # an empty ACK lets the server close a healthy stream.
-                        ack_data = data.get("data", "{}")
-                    await ws.send_json({
-                        "code": 200,
-                        "headers": {"messageId": headers.get("messageId", ""),
-                                    "contentType": "application/json"},
-                        "message": "OK", "data": ack_data,
-                    })
-                    if data.get("type") == "SYSTEM" and topic == "disconnect":
-                        break
-                elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
-                    break
+            callbacks = asyncio.Queue(maxsize=32)
 
-    async def _on_message(self, data: dict[str, Any], *, event_id: str | None = None) -> None:
-        sender_id = data.get("senderStaffId", data.get("senderId", ""))
-        conversation_type = data.get("conversationType", "1")
+            async def acknowledge(headers, payload, code=200):
+                await ws.send_json({"code": code, "headers": {
+                    "messageId": headers.get("messageId", ""), "contentType": "application/json",
+                }, "message": "OK" if code == 200 else "retry later", "data": payload})
+
+            async def process_callbacks():
+                while True:
+                    payload, headers = await callbacks.get()
+                    try:
+                        chat = payload.get("conversationId") if str(payload.get("conversationType")) == "2" else (
+                            payload.get("senderStaffId") or payload.get("senderId"))
+                        lock = self.bus.delivery_lock(f"ingress:dingtalk:{chat}") if isinstance(self.bus, MessageBus) else asyncio.Lock()
+                        async with lock:
+                            accepted = await self._on_message(payload, **(
+                                {"event_id": headers["messageId"]} if headers.get("messageId") else {}))
+                        await acknowledge(headers, json.dumps({"response": "OK"}), 500 if accepted is False else 200)
+                    except Exception as exc:
+                        logger.warning("DingTalk callback failed ({})", type(exc).__name__)
+                        if not getattr(ws, "closed", False):
+                            await acknowledge(headers, json.dumps({"response": "retry later"}), 500)
+                    finally:
+                        callbacks.task_done()
+
+            workers = [asyncio.create_task(process_callbacks()) for _ in range(4)]
+            try:
+                async for msg in ws:
+                    if msg.type == aiohttp.WSMsgType.TEXT:
+                        data = json.loads(msg.data)
+                        headers = data.get("headers", {})
+                        topic = headers.get("topic", "")
+                        if topic == _BOT_MESSAGE_TOPIC:
+                            try:
+                                callbacks.put_nowait((json.loads(data.get("data", "{}")), headers))
+                            except (asyncio.QueueFull, ValueError):
+                                await acknowledge(headers, json.dumps({"response": "retry later"}), 500)
+                            continue
+                        ack_data = data.get("data", "{}") if data.get("type") == "SYSTEM" else json.dumps({"response": "OK"})
+                        await acknowledge(headers, ack_data)
+                        if data.get("type") == "SYSTEM" and topic == "disconnect":
+                            break
+                    elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                        break
+                await asyncio.wait_for(callbacks.join(), 30)
+            finally:
+                for worker in workers:
+                    worker.cancel()
+                await asyncio.gather(*workers, return_exceptions=True)
+
+    async def _on_message(self, data: dict[str, Any], *, event_id: str | None = None) -> bool:
+        sender_id = str(data.get("senderStaffId") or data.get("senderId") or "")
+        conversation_type = str(data.get("conversationType", "1"))
+        if not sender_id or not self.is_allowed(sender_id):
+            return True
         # 私聊与群聊共用入口，接收日志用于区分身份拦截和上游未投递。
         logger.info(
             "DingTalk inbound: conversation_type={} msgtype={} staff_id_present={} sender_allowed={}",
@@ -386,6 +424,8 @@ class DingTalkChannel(BaseChannel):
                 real_url = await self._resolve_download_code(code)
                 if real_url:
                     media.append({'type': 'file', 'url': real_url, 'name': name})
+                else:
+                    return False
         elif msg_type == "picture":
             download_code = data.get("content", {}).get("downloadCode", "")
             if not download_code:
@@ -396,6 +436,7 @@ class DingTalkChannel(BaseChannel):
                     media.append({"type": "image", "url": real_url})
                 else:
                     logger.warning("DingTalk picture download code resolution failed")
+                    return False
         elif msg_type == "richText":
             for item in data.get("content", {}).get("richText", []):
                 if "text" in item:
@@ -404,16 +445,19 @@ class DingTalkChannel(BaseChannel):
                     real_url = await self._resolve_download_code(item["downloadCode"])
                     if real_url:
                         media.append({"type": "image", "url": real_url})
+                    else:
+                        return False
         if not text and not media:
-            return
+            return True
         chat_id = sender_id if conversation_type == "1" else data.get("conversationId", "")
-        await self._handle_message(
+        event = await self._handle_message(
             sender_id=sender_id, chat_id=chat_id, text=text,
             media=media or None,
             metadata={"conversation_type": conversation_type},
             is_group=conversation_type == "2",
             **({'event_id': data.get('msgId') or event_id} if data.get('msgId') or event_id else {}),
         )
+        return event is not None
 
     async def _resolve_download_code(self, download_code: str) -> str | None:
         """Convert DingTalk downloadCode to a real download URL.
@@ -429,7 +473,7 @@ class DingTalkChannel(BaseChannel):
         headers = {"x-acs-dingtalk-access-token": self._access_token}
         payload = {"downloadCode": download_code, "robotCode": self._robot_code}
         try:
-            async with self._session.post(url, json=payload, headers=headers) as resp:
+            async with self._session.post(url, json=payload, headers=headers, timeout=_SEND_TIMEOUT) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     return data.get("downloadUrl", "")

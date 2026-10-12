@@ -11,6 +11,35 @@
   "enabledSuccess": "通道已启用",
   "disabledSuccess": "通道已停用",
   "toggleFailed": "修改通道配置失败",
-  "actionSuccess": { "start": "通道已启动", "stop": "通道已停止", "restart": "通道已重启" },
-  "actionFailed": { "start": "通道启动失败", "stop": "通道停止失败", "restart": "通道重启失败" }
+  "actionSuccess": {
+    "start": "通道已启动",
+    "stop": "通道已停止",
+    "restart": "通道已重启"
+  },
+  "actionFailed": {
+    "start": "通道启动失败",
+    "stop": "通道停止失败",
+    "restart": "通道重启失败"
+  },
+  "delivery": {
+    "title": "消息投递恢复",
+    "refresh": "刷新记录",
+    "description": "已确认送达的内容不会重复发送。对于结果未知的消息，请先到目标聊天核对。",
+    "empty": "暂无需要处理的投递",
+    "retry": "继续发送未送达的内容",
+    "sending": "正在发送…",
+    "confirm": "已核对收到完整消息",
+    "retryTitle": "确认剩余内容未送达",
+    "retryWarning": "请先到目标聊天核对：已确认送达的部分会跳过。只有确认结果未知的部分也未送达后，才继续发送，避免接收人收到重复内容。",
+    "retryChecked": "已核对未送达，继续发送",
+    "confirmTitle": "登记完整消息已送达",
+    "confirmWarning": "请确认接收人已经收到完整消息和全部附件。登记后将停止重试，不会再发送。",
+    "confirmChecked": "已核对完整收到",
+    "parts": "已确认 {{count}} 段 · 附件 {{files}} 个",
+    "unknown": "部分发送结果未知，需要核对后处理。",
+    "unsent": "仍有内容未送达，可以从已确认的位置继续。",
+    "success": "投递记录已更新",
+    "failed": "投递恢复未完成",
+    "viewFull": "查看完整消息和附件名称"
+  }
 }

@@ -55,7 +55,10 @@ class MCPManager:
         self._registry_lock = asyncio.Lock()
         self._stopping = False
         if extension is not None:
-            extension.bind_mcp_manager(self)
+            try:
+                extension.bind_mcp_manager(self)
+            except Exception as exc:
+                raise RuntimeExtensionError("runtime extension MCP binding failed") from exc
 
     async def start_all(self, servers: dict[str, MCPServerConfig]) -> None:
         self._stopping = False
@@ -169,8 +172,10 @@ class MCPManager:
 
     async def refresh_tools(self, name: str) -> bool:
         """Refresh stateless project directories before a turn; no restart or SSE notification required."""
-        client, registry = self.get_client(name), self._registry
-        if client is None or registry is None:
+        # Recovery is a trusted directory rebuild, not a model/private tool call.
+        # A remembered fault must not prevent rebuilding a now-valid policy.
+        client, registry = self._clients.get(name), self._registry
+        if client is None or not client.is_connected or registry is None:
             return False
         async with self._registry_lock:
             try:
@@ -557,6 +562,10 @@ class MCPManager:
                     trust_level=cfg.trust_level if cfg else "untrusted",
                     registered_name=entry.registered_name,
                 )
+                if adapter is not None and (
+                    not isinstance(adapter, MCPToolAdapter) or adapter.name != entry.registered_name
+                ):
+                    raise ValueError("MCP adapters must preserve their validated registered name")
             except Exception as exc:
                 if self._extension is None:
                     raise
@@ -572,9 +581,15 @@ class MCPManager:
             registered_names.append(adapter.name)
 
         # Build/validate first; the synchronous swap leaves no await-sized gap for another user.
-        self._unregister_server_tools(name)
-        for adapter in adapters:
-            registry.register(adapter)
+        try:
+            registry.replace_group(self._registered_tools.get(name, []), adapters)
+        except Exception as exc:
+            if self._extension is None:
+                raise
+            failure = RuntimeExtensionError("runtime extension returned an invalid tool directory")
+            self._extension_errors[name] = failure
+            self._unregister_server_tools(name)
+            raise failure from exc
 
         self._extension_errors.pop(name, None)
         self._registered_tools[name] = registered_names

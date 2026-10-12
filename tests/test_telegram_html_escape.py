@@ -51,7 +51,7 @@ def _channel(api_response: dict | None = None) -> TelegramChannel:
     channel = TelegramChannel.__new__(TelegramChannel)
     channel._session = MagicMock()
     if api_response is None:
-        api_response = {"ok": True, "result": {"message_id": 1}}
+        api_response = {"message_id": 1}
     channel._api = AsyncMock(return_value=api_response)
     channel._chunk_text = lambda text, limit: [text]
     channel._running = True
@@ -67,7 +67,7 @@ async def test_send_escapes_html_metacharacters():
 
     async def _capture(method, **kwargs):
         captured.append({"method": method, **kwargs})
-        return {"ok": True, "result": {"message_id": 1}}
+        return {"message_id": 1}
 
     channel._api = _capture
     event = OutboundEvent.text_reply(
@@ -96,7 +96,7 @@ async def test_send_opt_out_preserves_markup():
 
     async def _capture(method, **kwargs):
         captured.append({"method": method, **kwargs})
-        return {"ok": True, "result": {"message_id": 1}}
+        return {"message_id": 1}
 
     channel._api = _capture
     event = OutboundEvent.text_reply(
@@ -115,7 +115,7 @@ async def test_edit_message_also_escapes():
 
     async def _capture(method, **kwargs):
         captured.append({"method": method, **kwargs})
-        return {"ok": True, "result": {"message_id": 1}}
+        return {"message_id": 1}
 
     channel._api = _capture
     await channel.edit_message("c", 1, "a & b < c")

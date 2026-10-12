@@ -105,7 +105,7 @@ Use the gateway's existing `send_file` tool:
 
 - Direct chats use the enterprise `userId` (`senderStaffId` in callbacks), not a personal DingTalk handle.
 - Groups use the callback's `conversationId`, typically starting with `cid`, not the group number shown in the client. Without `conversation_type` metadata, tool events route `cid` IDs to the group API; explicit metadata takes precedence.
-- Files: `xlsx`, `pdf`, `zip`, `rar`, `doc`, `docx`. Images: `jpg`, `gif`, `png`, `bmp`, delivered using the image template. Archive other formats as ZIP first. Only nonempty local files are accepted, up to 20MB each.
+- Files: `xlsx`, `pdf`, `zip`, `rar`, `doc`, `docx`. Images: `jpg`, `jpeg`, `gif`, `png`, `bmp`, delivered using the image template. `as_image: false` keeps the file type; unsupported file formats require a ZIP archive. Only nonempty local files are accepted, up to 20MB each.
 - Enable the enterprise robot message-sending permission and add the robot to the target group. Media-upload permission is enabled by default.
 
 The channel validates files, uploads them through `POST https://oapi.dingtalk.com/media/upload`, then sends the returned `media_id` using `sampleFile` (`sampleImageMsg` for images). The caption is sent first as a separate text message. Upload errors, send errors, invalid recipients and recipient throttling return failure; a delivered caption alone never counts as a delivered file. A send receipt does not mean the recipient has read or downloaded the file.
@@ -113,6 +113,22 @@ The channel validates files, uploads them through `POST https://oapi.dingtalk.co
 API references: [media upload](https://open.dingtalk.com/document/orgapp/upload-media-files), [robot message types](https://open.dingtalk.com/document/orgapp/types-of-messages-sent-by-robots), [direct messages](https://open.dingtalk.com/document/orgapp/chatbots-send-one-on-one-chat-messages-in-batches), [group messages](https://open.dingtalk.com/document/orgapp/the-robot-sends-a-group-message).
 
 ---
+
+## Long replies and delivery recovery
+
+Long replies are split with numbered headers and encoded-size limits. SQLite stores each confirmed receipt, so retrying after a channel or process restart skips acknowledged parts. Captions and attachments also retain separate checkpoints. Slow inbound callbacks run behind a bounded queue while Stream pings remain responsive; callbacks are acknowledged only after admission.
+
+Administrators can open **Channels → Delivery recovery** to inspect the full message, attachment names and confirmed part count. Definite rejections can be resumed. Timeouts, server errors and missing receipts require checking the target chat before choosing to retry or confirm that the entire message was received. Recovery preserves the original delivery identity and records the operator's decision. The APIs are `GET /api/v1/deliveries`, `GET /api/v1/deliveries/{id}` and `POST /api/v1/deliveries/{id}/recover`, using the configured gateway prefix.
+
+Short text and final stream edits also retain recovery records. Checkpoints are bounded at 100,000 records and never automatically evict uncertain identities; new deliveries fail explicitly when capacity is exhausted. Lightweight adapters without SQLite retain checkpoints only for their current instance; DingTalk multipart text requires durable storage.
+
+Attachment recovery requires the original file at its original path with unchanged contents. Restore that file before continuing, or send the changed file as a new message. Different content cannot reuse a previous delivery identity.
+
+## Clarifying questions
+
+A question becomes answerable only after confirmed delivery. The session remembers it across restarts, including its originating task. Replying with an option letter or free text continues the same task, plan and artifact workflow. Tools following a question in the same model batch wait for the answer. Option labels preserve legitimate text such as “A 股”.
+
+Feishu and Telegram group replies from the question owner can continue without another mention. Other participants still follow normal group admission rules. Slack direct messages share a stable conversation; explicit threads remain separate. Pending questions follow `session.im_clarify_pending_ttl_seconds`; an explicit quote to another message takes precedence.
 
 ## Authentication
 
@@ -139,7 +155,7 @@ The token is valid for 2 hours. The channel layer handles automatic refresh — 
 
 **Q: What happens when rate limits are triggered?**
 
-DingTalk imposes rate limits on bot message sending. When throttled, the channel automatically backs off (300-second backoff). No manual intervention is needed. If rate limits are triggered frequently:
+Text sends are spaced at least 3 seconds apart. Explicit platform rejections retain successful receipts and can be resumed from Delivery recovery. Unknown outcomes require checking the target chat before retrying. If rate limits are triggered frequently:
 
 - Consolidate multiple short replies into a single message
 - Check for abnormal duplicate message sends

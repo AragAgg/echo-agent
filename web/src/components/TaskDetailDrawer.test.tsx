@@ -64,6 +64,34 @@ afterEach(() => {
 });
 
 describe("TaskDetailDrawer 详情", () => {
+  it("回答追问后沿用同一任务，发送问题ID并更新看板", async () => {
+    const t = task({ status: "blocked", blocked_reason: "选哪一项？", metadata: {
+      _awaiting_clarification: true, _clarification: { id: "q1", channel: "task", options: ["甲", "乙"] },
+    } });
+    const spy = vi.spyOn(api, "apiFetch").mockResolvedValue({ task: { ...t, status: "queued" } } as never);
+    useKanbanStore.setState({ tasks: [t] });
+    renderDrawer(t);
+    expect(screen.getByRole("button", { name: "提交回答并继续" })).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "乙" }));
+    fireEvent.click(screen.getByRole("button", { name: "提交回答并继续" }));
+    await waitFor(() => expect(spy).toHaveBeenCalledWith("/tasks/t1/clarification", {
+      method: "POST", body: JSON.stringify({ question_id: "q1", answer: "乙" }),
+    }));
+    await waitFor(() => expect(useKanbanStore.getState().tasks[0].status).toBe("queued"));
+  });
+
+  it("回答提交失败时保留用户输入", async () => {
+    const t = task({ status: "blocked", metadata: {
+      _awaiting_clarification: true, _clarification: { id: "q1", channel: "task", options: [] },
+    } });
+    vi.spyOn(api, "apiFetch").mockRejectedValue(new Error("stale question"));
+    renderDrawer(t);
+    fireEvent.change(screen.getByLabelText("你的回答"), { target: { value: "按最新方案" } });
+    fireEvent.click(screen.getByRole("button", { name: "提交回答并继续" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "提交回答并继续" })).not.toBeDisabled());
+    expect(screen.getByLabelText("你的回答")).toHaveValue("按最新方案");
+  });
+
   it("展示后端返回的 result —— 之前它在界面上没有任何落点", async () => {
     const t = task({ status: "success", result: "已发送到群里" });
     mockApi(t);

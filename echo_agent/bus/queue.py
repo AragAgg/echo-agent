@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import weakref
 from collections import defaultdict
 from typing import TYPE_CHECKING, Awaitable, Callable
 
@@ -39,6 +40,8 @@ class MessageBus:
             maxsize=max_queue_size,
         )
         self._outbound_handlers: dict[str, list[OutboundHandler]] = defaultdict(list)
+        self._clarification_checker = None
+
         self._global_outbound_handlers: list[OutboundHandler] = []
         self._inbound_subscribers: list[InboundHandler] = []
         self._inbound_rejection_handlers: list[InboundRejectionHandler] = []
@@ -66,6 +69,31 @@ class MessageBus:
         )
         self._rate_limiter: SessionRateLimiter | None = None
         self._turn_run_store = None
+        self._delivery_locks = weakref.WeakValueDictionary()
+        self._tracked_outbound: set[str] = set()
+
+    @property
+    def has_durable_outbound_storage(self) -> bool:
+        return self._turn_run_store is not None
+
+    def delivery_lock(self, key: str) -> asyncio.Lock:
+        lock = self._delivery_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._delivery_locks[key] = lock
+        return lock
+
+    def track_outbound(self, event_id: str) -> None:
+        self._tracked_outbound.add(event_id)
+
+    def set_clarification_checker(self, checker) -> None:
+        self._clarification_checker = checker
+
+    async def has_clarification(self, channel: str, chat_id: str, sender_id: str,
+                                *, is_group: bool = False) -> bool:
+        if self._clarification_checker is None:
+            return False
+        return await self._clarification_checker(channel, chat_id, sender_id, is_group=is_group)
 
     def set_rate_limiter(self, limiter: SessionRateLimiter) -> None:
         self._rate_limiter = limiter
@@ -173,6 +201,20 @@ class MessageBus:
                     self._publishers_idle.set()
 
     async def publish_outbound(self, event: OutboundEvent) -> DeliveryResult:
+        result = await self._dispatch_outbound(event)
+        if self._turn_run_store is not None and event.event_id in self._tracked_outbound:
+            try:
+                await self._turn_run_store.update_outbound(
+                    event.event_id, "delivered" if result.ok else
+                    "unknown" if result.detail.get("delivery_unknown") else "failed", result.error or "",
+                )
+            except Exception:
+                logger.warning("Could not update outbound recovery summary for {}", event.event_id)
+            if result.ok:
+                self._tracked_outbound.discard(event.event_id)
+        return result
+
+    async def _dispatch_outbound(self, event: OutboundEvent) -> DeliveryResult:
         if not self._global_outbound_handlers and event.channel not in self._outbound_handlers:
             logger.warning("No outbound handler for channel={}", event.channel)
             return DeliveryResult(DeliveryStage.NO_HANDLER, event.channel)

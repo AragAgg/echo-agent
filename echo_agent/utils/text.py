@@ -5,7 +5,8 @@ from __future__ import annotations
 import re
 
 
-def split_message(text: str, max_len: int = 2000, *, min_chunk_ratio: float = 0.75) -> list[str]:
+def split_message(text: str, max_len: int = 2000, *, min_chunk_ratio: float = 0.75,
+                  preserve_whitespace: bool = False) -> list[str]:
     """Split a long message into as few chunks as possible.
 
     Natural boundaries are preferred only when they are close enough to the
@@ -21,12 +22,31 @@ def split_message(text: str, max_len: int = 2000, *, min_chunk_ratio: float = 0.
             chunks.append(text)
             break
         cut = _best_split_position(text, max_len, min_cut)
-        chunk = text[:cut].rstrip()
+        chunk = text[:cut] if preserve_whitespace else text[:cut].rstrip()
         if not chunk:
             chunk = text[:cut]
         chunks.append(chunk)
-        text = text[cut:].lstrip()
+        text = text[cut:] if preserve_whitespace else text[cut:].lstrip()
     return chunks
+
+
+def split_encoded_message(text: str, budget: int, encode) -> list[str]:
+    """Split at natural boundaries using the actual transport encoding budget."""
+    chunks = []
+    while text:
+        lo, hi = 1, len(text)
+        if encode(text[:1]) > budget:
+            raise ValueError("message budget cannot fit one character")
+        while lo < hi:
+            middle = (lo + hi + 1) // 2
+            if encode(text[:middle]) <= budget:
+                lo = middle
+            else:
+                hi = middle - 1
+        cut = _best_split_position(text, lo, max(1, int(lo * 0.75))) if lo < len(text) else lo
+        chunks.append(text[:cut])
+        text = text[cut:]
+    return chunks or [""]
 
 
 def _best_split_position(text: str, max_len: int, min_cut: int) -> int:

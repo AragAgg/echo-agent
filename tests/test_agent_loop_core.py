@@ -136,6 +136,8 @@ async def test_tool_cancellation_records_circuit_breaker_failure(tmp_path: Path)
     interrupted tool just stays "untracked" and the breaker stat skews."""
     from echo_agent.tools import Tool, ToolResult
 
+    started = asyncio.Event()
+
     class _SlowTool(Tool):
         name = "slow_tool"
         description = "stub that hangs forever"
@@ -143,6 +145,7 @@ async def test_tool_cancellation_records_circuit_breaker_failure(tmp_path: Path)
         timeout_seconds = 60
 
         async def execute(self, params, ctx=None):
+            started.set()
             await asyncio.sleep(99)
             return ToolResult(success=True, output="never")
 
@@ -158,7 +161,9 @@ async def test_tool_cancellation_records_circuit_breaker_failure(tmp_path: Path)
     event = InboundEvent.text_message(channel="test", sender_id="u1", chat_id="c1", text="hang")
 
     task = asyncio.create_task(agent._process_event(event, "trace_cancel"))
-    await asyncio.sleep(0.05)
+    # Cancel the actual tool, rather than guessing when context preparation has
+    # finished on this machine. An early cancellation never tested the breaker.
+    await asyncio.wait_for(started.wait(), timeout=5)
     task.cancel()
     try:
         await task

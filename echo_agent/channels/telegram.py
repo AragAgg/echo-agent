@@ -15,9 +15,9 @@ from loguru import logger
 
 from echo_agent.bus.events import OutboundEvent
 from echo_agent.bus.queue import MessageBus
-from echo_agent.channels.base import BaseChannel, SendResult
+from echo_agent.channels.base import BaseChannel, SendResult, DeliveryRejected
 from echo_agent.config.schema import TelegramChannelConfig
-from echo_agent.utils.text import split_message
+from echo_agent.utils.text import split_message, split_encoded_message
 from echo_agent.bus.events import PollRequest
 
 _API = "https://api.telegram.org/bot{token}/{method}"
@@ -145,35 +145,35 @@ class TelegramChannel(BaseChannel):
         # lands. Set metadata["telegram_markup"] = True to send pre-formatted
         # HTML and skip escaping.
         if not event.metadata.get("telegram_markup"):
-            text = _escape_html(text)
+            # Split before escaping, while budgeting the escaped payload. This
+            # never cuts an entity such as &amp; in half at a message boundary.
+            chunks = [_escape_html(part) for part in split_encoded_message(
+                text, _MAX_TEXT, lambda part: len(_escape_html(part)),
+            )]
+        else:
+            chunks = self._chunk_text(text, _MAX_TEXT)
         chat_id = event.chat_id
-        reply_to = event.reply_to_id
-        first_result: SendResult | None = None
-        has_failure = False
-        for chunk in self._chunk_text(text, _MAX_TEXT):
+        async def send_part(index, chunk):
+            reply_to = event.reply_to_id if index == 0 else None
             payload = {
                 "chat_id": chat_id,
                 "text": chunk,
                 "parse_mode": "HTML",
                 **({"reply_to_message_id": reply_to} if reply_to else {}),
             }
-            if reply_to:
-                result, err = await self._api("sendMessage", _return_error=True, json=payload)
-                if result is None and "replied" in err.lower():
-                    logger.debug("Telegram reply anchor gone, resending without it: {}", err)
+            try:
+                result = await self._api("sendMessage", _raise_delivery=True, json=payload)
+            except DeliveryRejected as exc:
+                if reply_to and "replied" in str(exc).lower():
                     payload.pop("reply_to_message_id", None)
-                    result = await self._api("sendMessage", json=payload)
-            else:
-                result = await self._api("sendMessage", json=payload)
+                    result = await self._api("sendMessage", _raise_delivery=True, json=payload)
+                else:
+                    raise
             send_result = self._send_result(result, "Telegram sendMessage failed")
-            if first_result is None:
-                first_result = send_result
-            if not send_result.success:
-                has_failure = True
-            reply_to = None
-        if first_result and has_failure and first_result.success:
-            first_result = SendResult(success=False, error="one or more chunks failed")
-        return first_result
+            if not isinstance(result, dict) or not result.get("message_id"):
+                return SendResult(success=False, error="Telegram send receipt missing", delivery_unknown=True)
+            return send_result
+        return await self.send_parts(event, chunks, send_part)
 
     async def edit_message(
         self,
@@ -190,12 +190,18 @@ class TelegramChannel(BaseChannel):
         # pre-formatted Telegram markup.
         if not (metadata or {}).get("telegram_markup"):
             text = _escape_html(text)
-        result = await self._api("editMessageText", json={
-            "chat_id": chat_id,
-            "message_id": message_id,
-            "text": text,
-            "parse_mode": "HTML",
-        })
+        try:
+            result = await self._api("editMessageText", _raise_delivery=True, json={
+                "chat_id": chat_id, "message_id": message_id, "text": text, "parse_mode": "HTML",
+            })
+        except DeliveryRejected as exc:
+            if "message is not modified" in str(exc).lower():
+                return SendResult(success=True, message_id=message_id)
+            return SendResult(success=False, message_id=message_id, error=str(exc))
+        except Exception as exc:
+            return SendResult(success=False, message_id=message_id, error=type(exc).__name__, delivery_unknown=True)
+        if result is None:
+            return SendResult(success=False, error="Telegram edit result unknown", delivery_unknown=True)
         return self._send_result(result, "Telegram editMessageText failed", fallback_message_id=message_id)
 
     async def send_typing(self, chat_id: str, metadata: dict[str, Any] | None = None) -> None:
@@ -304,7 +310,7 @@ class TelegramChannel(BaseChannel):
         text = msg.get("text", "") or msg.get("caption", "") or ""
 
         if chat.get("type") in ("group", "supergroup") and self._group_policy == "mention":
-            if not self._is_mentioned(msg, text):
+            if not self._is_mentioned(msg, text) and not await self.is_clarification_reply(sender_id, chat_id):
                 return
 
         media: list[dict[str, str]] = []
@@ -393,7 +399,8 @@ class TelegramChannel(BaseChannel):
 
         return await self._resolve_media_to_cache(file_id, "telegram", fetch, suffix=ext)
 
-    async def _api(self, method: str, *, _return_error: bool = False, **kwargs: Any) -> Any:
+    async def _api(self, method: str, *, _return_error: bool = False,
+                   _raise_delivery: bool = False, **kwargs: Any) -> Any:
         if not self._session:
             return (None, "") if _return_error else None
         url = _API.format(token=self._token, method=method)
@@ -407,11 +414,20 @@ class TelegramChannel(BaseChannel):
                         logger.warning("Telegram rate-limited, retry_after={}s", retry_after)
                     else:
                         logger.warning("Telegram API {}: {}", method, data.get("description", ""))
+                    if _raise_delivery:
+                        error = str(data.get("description", "Telegram request refused"))
+                        if resp.status >= 500 or int(data.get("error_code") or 0) >= 500:
+                            raise RuntimeError(error)
+                        raise DeliveryRejected(error)
                     return (None, str(data.get("description", ""))) if _return_error else None
                 result = data.get("result")
                 return (result, "") if _return_error else result
+        except DeliveryRejected:
+            raise
         except Exception as e:
-            logger.error("Telegram API {} failed: {}", method, e)
+            logger.error("Telegram API {} failed ({})", method, type(e).__name__)
+            if _raise_delivery:
+                raise RuntimeError(f"Telegram transport failure ({type(e).__name__})") from e
             return (None, str(e)) if _return_error else None
 
     @staticmethod
@@ -428,4 +444,4 @@ class TelegramChannel(BaseChannel):
 
     @staticmethod
     def _chunk_text(text: str, limit: int) -> list[str]:
-        return split_message(text, limit)
+        return split_message(text, limit, preserve_whitespace=True)

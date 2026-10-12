@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import hashlib
 import time
 import xml.etree.ElementTree as ET
@@ -13,6 +15,7 @@ from loguru import logger
 from echo_agent.bus.events import OutboundEvent
 from echo_agent.bus.queue import MessageBus
 from echo_agent.channels.base import BaseChannel, SendResult
+from echo_agent.utils.text import split_encoded_message
 from echo_agent.channels.wecom_crypto import decrypt_message, verify_signature
 from echo_agent.config.schema import WeComChannelConfig
 
@@ -64,24 +67,28 @@ class WeComChannel(BaseChannel):
         text = event.text or ""
         if not text or not self._session:
             return SendResult(success=False, error="no text or no session")
-        await self._ensure_token()
-        url = f"{_API_BASE}/message/send?access_token={self._access_token}"
-        payload = {
-            "touser": event.chat_id,
-            "msgtype": "text",
-            "agentid": int(self._agent_id) if self._agent_id.isdigit() else 0,
-            "text": {"content": text},
-        }
-        try:
+        async def before_send(index, part):
+            if index > 0:
+                await asyncio.sleep(0.5)
+            await self._ensure_token()
+        async def send_part(index, part):
+            url = f"{_API_BASE}/message/send?access_token={self._access_token}"
+            payload = {"touser": event.chat_id, "msgtype": "text",
+                       "agentid": int(self._agent_id) if self._agent_id.isdigit() else 0,
+                       "text": {"content": part}}
             async with self._session.post(url, json=payload) as resp:
+                if resp.status >= 400:
+                    return SendResult(success=False, error=f"WeCom HTTP {resp.status}", delivery_unknown=resp.status >= 500)
                 data = await resp.json()
-                if data.get("errcode"):
-                    logger.warning("WeCom send error: {} {}", data.get("errcode"), data.get("errmsg"))
-                    return SendResult(success=False, error=f"{data.get('errcode')}: {data.get('errmsg')}")
-        except Exception as e:
-            logger.error("WeCom send error: {}", e)
-            return SendResult(success=False, error=str(e))
-        return SendResult(success=True)
+                if not isinstance(data, dict) or "errcode" not in data:
+                    return SendResult(success=False, error="WeCom acknowledgement missing", delivery_unknown=True)
+                if data["errcode"] != 0:
+                    return SendResult(success=False, error=f"{data['errcode']}: {data.get('errmsg', '')}")
+                if any(data.get(key) for key in ("invaliduser", "invalidparty", "invalidtag")):
+                    return SendResult(success=False, error="WeCom rejected some recipients", delivery_unknown=True)
+                return SendResult(success=True, message_id=str(data.get("msgid") or ""))
+        return await self.send_parts(event, split_encoded_message(text, 2000, lambda part: len(part.encode("utf-8"))),
+                                     send_part, before_send=before_send)
 
     def _check_signature(self, signature: str, timestamp: str, nonce: str) -> bool:
         items = sorted([self._token, timestamp, nonce])

@@ -39,6 +39,8 @@ class ClarifyRequest:
     # Monotonic timestamp of registration; only the IM (non-blocking) path reads
     # it, to expire a pending follow-up the user never got around to answering.
     created_at: float = field(default_factory=time.monotonic)
+    delivered: bool = True
+    continuation: dict = field(default_factory=dict)
 
 
 class ClarifyManager:
@@ -112,25 +114,45 @@ class ClarifyManager:
     # ---- IM (non-blocking) follow-up registry, keyed by session_key --------
 
     def register_im_pending(self, session_key: str, question: str,
-                            options: list[str] | None = None, user_id: str = "") -> ClarifyRequest:
+                            options: list[str] | None = None, user_id: str = "", *,
+                            delivered: bool = True, continuation: dict | None = None) -> ClarifyRequest:
         """Remember an IM channel's question so the next inbound message on this
         session can be routed as its answer. Overwrites any prior unanswered
         pending for the same session — the latest question is the live one."""
         req = ClarifyRequest(question=question, options=_as_option_list(options),
-                             user_id=user_id, session_key=session_key)
+                             user_id=user_id, session_key=session_key, delivered=delivered,
+                             continuation=dict(continuation or {}))
         self._im_pending[session_key] = req
         return req
 
-    def take_im_pending(self, session_key: str, ttl_seconds: float) -> ClarifyRequest | None:
+    def peek_im_pending(self, session_key: str, ttl_seconds: float,
+                        user_id: str = "", *, include_staged: bool = False) -> ClarifyRequest | None:
+        req = self._im_pending.get(session_key)
+        if req is None or not req.delivered and not include_staged:
+            return None
+        if ttl_seconds > 0 and time.monotonic() - req.created_at > ttl_seconds:
+            self._im_pending.pop(session_key, None)
+            return None
+        if user_id and req.user_id and user_id != req.user_id:
+            return None
+        return req
+
+    def confirm_im_delivery(self, session_key: str) -> ClarifyRequest | None:
+        req = self._im_pending.get(session_key)
+        if req is not None:
+            req.delivered = True
+            req.created_at = time.monotonic()
+        return req
+
+    def take_im_pending(self, session_key: str, ttl_seconds: float,
+                        user_id: str = "") -> ClarifyRequest | None:
         """Pop the pending IM follow-up for this session if it exists and has not
         expired. Returns None (and clears an expired entry) otherwise, so a stale
         pending degrades to normal message handling rather than mis-binding."""
-        req = self._im_pending.get(session_key)
+        req = self.peek_im_pending(session_key, ttl_seconds, user_id)
         if req is None:
             return None
         self._im_pending.pop(session_key, None)
-        if ttl_seconds > 0 and (time.monotonic() - req.created_at) > ttl_seconds:
-            return None
         return req
 
     def clear_im_pending(self, session_key: str) -> None:

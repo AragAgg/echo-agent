@@ -80,9 +80,7 @@ class DiscordChannel(BaseChannel):
         if not text or not self._session:
             return None
         url = f"{_API_BASE}/channels/{event.chat_id}/messages"
-        first_result: SendResult | None = None
-        has_failure = False
-        for chunk in _chunk_text(text, _MAX_TEXT):
+        async def send_part(index, chunk):
             payload: dict[str, Any] = {"content": chunk}
             if event.reply_to_id:
                 payload["message_reference"] = {"message_id": event.reply_to_id}
@@ -95,13 +93,8 @@ class DiscordChannel(BaseChannel):
                 logger.debug("Discord reply anchor gone, resending without it: {}", send_result.error)
                 payload.pop("message_reference", None)
                 send_result = await self._post_message(url, payload)
-            if first_result is None:
-                first_result = send_result
-            if not send_result.success:
-                has_failure = True
-        if first_result and has_failure and first_result.success:
-            first_result = SendResult(success=False, error="one or more chunks failed")
-        return first_result
+            return send_result
+        return await self.send_parts(event, split_message(text, _MAX_TEXT, preserve_whitespace=True), send_part)
 
     async def _post_message(self, url: str, payload: dict[str, Any]) -> SendResult:
         try:
@@ -109,12 +102,14 @@ class DiscordChannel(BaseChannel):
                 if resp.status >= 400:
                     body = await resp.text()
                     logger.warning("Discord send failed ({}): {}", resp.status, body[:200])
-                    return SendResult(success=False, error=body[:200])
+                    return SendResult(success=False, error=body[:200], delivery_unknown=resp.status >= 500)
                 data = await resp.json()
+                if not data.get("id"):
+                    return SendResult(success=False, error="Discord send receipt missing", delivery_unknown=True)
                 return SendResult(success=True, message_id=str(data.get("id", "")))
         except Exception as e:
             logger.error("Discord send error: {}", e)
-            return SendResult(success=False, error=str(e))
+            return SendResult(success=False, error=type(e).__name__, delivery_unknown=True)
 
     async def edit_message(
         self,
@@ -135,12 +130,12 @@ class DiscordChannel(BaseChannel):
                 if resp.status >= 400:
                     body = await resp.text()
                     logger.warning("Discord edit failed ({}): {}", resp.status, body[:200])
-                    return SendResult(success=False, message_id=message_id, error=body[:200])
+                    return SendResult(success=False, message_id=message_id, error=body[:200], delivery_unknown=resp.status >= 500)
                 data = await resp.json()
                 return SendResult(success=True, message_id=str(data.get("id") or message_id))
         except Exception as e:
             logger.error("Discord edit error: {}", e)
-            return SendResult(success=False, message_id=message_id, error=str(e))
+            return SendResult(success=False, message_id=message_id, error=type(e).__name__, delivery_unknown=True)
 
     async def send_typing(self, chat_id: str, metadata: dict[str, Any] | None = None) -> None:
         if not self._session or chat_id in self._typing_tasks:

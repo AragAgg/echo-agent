@@ -9,6 +9,8 @@ Features:
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import uuid
 import json
 import time
 from pathlib import Path
@@ -20,6 +22,7 @@ from loguru import logger
 from echo_agent.bus.events import OutboundEvent
 from echo_agent.bus.queue import MessageBus
 from echo_agent.channels.base import BaseChannel, SendResult
+from echo_agent.utils.text import split_encoded_message
 from echo_agent.config.schema import MatrixChannelConfig
 from echo_agent.bus.events import PollRequest
 
@@ -97,38 +100,39 @@ class MatrixChannel(BaseChannel):
         if not self.should_deliver(event):
             return SendResult(success=True, skipped=True)
         text = event.text or ""
-        media = event.media or []
+        media = [{"type": getattr(block.type, "value", block.type), "url": block.url}
+                 for block in event.content if block.url]
         if not text and not media:
             return SendResult(success=False, error="no content")
         if not self._session:
             return SendResult(success=False, error="no session")
 
         room_id = event.chat_id
-
+        payloads = []
         for item in media:
             media_type = item.get("type", "image")
             media_url = item.get("url", "")
             if media_url:
-                await self._send_media(room_id, media_type, media_url)
-
-        message_id = ""
+                msgtype = {"image": "m.image", "file": "m.file", "audio": "m.audio", "voice": "m.audio", "video": "m.video"}.get(media_type, "m.file")
+                payloads.append({"msgtype": msgtype, "body": f"{media_type} attachment", "url": media_url})
         if text:
-            txn_id = f"m{id(text)}{time.monotonic():.0f}"
+            chunks = split_encoded_message(text, 50000, lambda part: len(json.dumps({"msgtype": "m.text", "body": part}).encode()))
+            payloads.extend({"msgtype": "m.text", "body": chunk} for chunk in chunks)
+        parts = [json.dumps(payload, sort_keys=True) for payload in payloads]
+        async def send_part(index, part):
+            # Matrix's transaction key also protects a retransmission at the
+            # homeserver, independently of the local checkpoint.
+            txn_id = hashlib.sha256(f"{event.event_id}:{index}".encode()).hexdigest()
             url = f"{self._homeserver}/_matrix/client/v3/rooms/{room_id}/send/m.room.message/{txn_id}"
-            payload = {"msgtype": "m.text", "body": text}
-            try:
-                async with self._session.put(url, json=payload) as resp:
-                    if resp.status >= 400:
-                        body = await resp.text()
-                        logger.warning("Matrix send failed ({}): {}", resp.status, body[:200])
-                        return SendResult(success=False, error=body[:200])
-                    data = await resp.json()
-                    message_id = data.get("event_id", "")
-            except Exception as e:
-                logger.error("Matrix send error: {}", e)
-                return SendResult(success=False, error=str(e))
-
-        return SendResult(success=True, message_id=message_id)
+            async with self._session.put(url, json=json.loads(part)) as resp:
+                if resp.status >= 400:
+                    return SendResult(success=False, error=f"Matrix HTTP {resp.status}", delivery_unknown=resp.status >= 500)
+                data = await resp.json()
+                message_id = data.get("event_id", "")
+                if not message_id:
+                    return SendResult(success=False, error="Matrix send receipt missing", delivery_unknown=True)
+                return SendResult(success=True, message_id=message_id)
+        return await self.send_parts(event, parts, send_part)
 
     async def _send_media(self, room_id: str, media_type: str, media_url: str) -> SendResult:
         if not self._session:
@@ -142,7 +146,7 @@ class MatrixChannel(BaseChannel):
         }
         msgtype, fallback = type_map.get(media_type, ("m.file", "file"))
 
-        txn_id = f"m{time.monotonic():.0f}"
+        txn_id = f"m{uuid.uuid4().hex}"
         url = f"{self._homeserver}/_matrix/client/v3/rooms/{room_id}/send/m.room.message/{txn_id}"
         payload = {
             "msgtype": msgtype,
@@ -183,7 +187,7 @@ class MatrixChannel(BaseChannel):
     async def send_reaction(self, chat_id: str, message_id: str, emoji: str, metadata: dict[str, Any] | None = None) -> SendResult:
         if not getattr(self.config, "reactions_enabled", True) or not self._session:
             return SendResult(success=False, error="reactions disabled or no session")
-        txn_id = f"r{id(emoji)}{time.monotonic():.0f}"
+        txn_id = f"r{uuid.uuid4().hex}"
         url = f"{self._homeserver}/_matrix/client/v3/rooms/{chat_id}/send/m.reaction/{txn_id}"
         payload = {
             "m.relates_to": {
@@ -216,7 +220,7 @@ class MatrixChannel(BaseChannel):
     async def delete_message(self, chat_id: str, message_id: str, metadata: dict[str, Any] | None = None) -> SendResult:
         if not self._session:
             return SendResult(success=False, error="no session")
-        txn_id = f"d{id(message_id)}{time.monotonic():.0f}"
+        txn_id = f"d{uuid.uuid4().hex}"
         url = f"{self._homeserver}/_matrix/client/v3/rooms/{chat_id}/redact/{message_id}/{txn_id}"
         try:
             async with self._session.put(url, json={}) as resp:
@@ -230,7 +234,7 @@ class MatrixChannel(BaseChannel):
     async def send_poll(self, chat_id: str, poll: PollRequest, metadata: dict[str, Any] | None = None) -> SendResult:
         if not self._session:
             return SendResult(success=False, error="no session")
-        txn_id = f"p{id(poll)}{time.monotonic():.0f}"
+        txn_id = f"p{uuid.uuid4().hex}"
         url = f"{self._homeserver}/_matrix/client/v3/rooms/{chat_id}/send/m.poll.start/{txn_id}"
         answers = [{"id": str(i), "org.matrix.msc3381.v2.text": o} for i, o in enumerate(poll.options)]
         payload = {
@@ -254,7 +258,7 @@ class MatrixChannel(BaseChannel):
     async def send_voice(self, chat_id: str, audio_source: str, metadata: dict[str, Any] | None = None) -> SendResult:
         if not self._session:
             return SendResult(success=False, error="no session")
-        txn_id = f"v{id(audio_source)}{time.monotonic():.0f}"
+        txn_id = f"v{uuid.uuid4().hex}"
         url = f"{self._homeserver}/_matrix/client/v3/rooms/{chat_id}/send/m.room.message/{txn_id}"
         payload = {
             "msgtype": "m.audio",

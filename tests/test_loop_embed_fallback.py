@@ -8,9 +8,12 @@ class _NoEmbedProvider:
     """模拟 Anthropic 等不支持 embedding 的 provider。"""
 
 
-def test_local_fallback_selected_when_no_embed_provider():
+def test_local_fallback_selected_when_no_embed_provider(monkeypatch):
     """无 embed provider 且 local_embedding_model 非空 → 走本地兜底。"""
     from echo_agent.agent.loop import resolve_embed_fallback
+    # Selection is the subject of this unit test; package installation is an
+    # independent deployment choice and must not require an ONNX download here.
+    monkeypatch.setattr(LocalEmbedder, "available", property(lambda self: True))
 
     embed_fn, model_id, local = resolve_embed_fallback(
         embed_provider=None, emb_model=None,
@@ -19,6 +22,16 @@ def test_local_fallback_selected_when_no_embed_provider():
     assert embed_fn is not None
     assert model_id == "fastembed:BAAI/bge-small-zh-v1.5"
     assert isinstance(local, LocalEmbedder)
+    local.close()
+
+
+def test_missing_local_package_degrades_without_a_false_embedding_candidate(monkeypatch):
+    from echo_agent.agent.loop import resolve_embed_fallback
+    monkeypatch.setattr(LocalEmbedder, "available", property(lambda self: False))
+    embed_fn, model_id, local = resolve_embed_fallback(
+        embed_provider=None, emb_model=None, local_model_name="BAAI/bge-small-zh-v1.5",
+    )
+    assert embed_fn is None and model_id == "" and local is None
 
 
 def test_local_fallback_disabled_by_empty_config():

@@ -66,7 +66,7 @@ def test_render_text_without_options_is_just_the_question():
 
 
 @pytest.mark.parametrize("options", [
-    ["A 七猫", "B 点众"], [" A. 七猫", " b. 点众"],
+    [" A. 七猫", " b. 点众"],
     ["A、七猫", "B：点众"], ["A) 七猫", "B）点众"],
 ])
 def test_model_supplied_labels_are_rendered_once(options):
@@ -78,6 +78,11 @@ def test_model_supplied_labels_are_rendered_once(options):
 def test_option_content_starting_with_letter_is_preserved():
     rendered = ClarifyTool._render_text("选哪个？", ["AI 分析", "B站素材"])
     assert "A. AI 分析" in rendered and "B. B站素材" in rendered
+
+
+def test_ambiguous_letter_and_space_preserves_the_original_option():
+    rendered = ClarifyTool._render_text("选哪个市场？", ["A 股", "B 股"])
+    assert "A. A 股" in rendered and "B. B 股" in rendered
 
 
 def test_options_parameter_description_matches_the_channel():

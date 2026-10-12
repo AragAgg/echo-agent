@@ -63,8 +63,9 @@ def _event(channel: str) -> SimpleNamespace:
         {"question": "选哪个?", "options": "['甲','乙']"},
         {"question": {"text": "选哪个?"}},  # wrong type for a string parameter
         {"options": ["甲", "乙"]},  # missing the required question
+        {"question": "   "},
     ],
-    ids=["options_as_string", "question_as_dict", "missing_question"],
+    ids=["options_as_string", "question_as_dict", "missing_question", "blank_question"],
 )
 async def test_malformed_im_clarify_registers_no_pending(arguments):
     clarify = ClarifyManager()
@@ -79,6 +80,8 @@ async def test_wellformed_im_clarify_still_registers_pending():
     await _stage(clarify)._prepare_clarify(
         _call({"question": "选哪个?", "options": ["甲", "乙"]}), _event("weixin"),
     )
+    assert clarify.take_im_pending("weixin:u1", ttl_seconds=300) is None
+    clarify.confirm_im_delivery("weixin:u1")
     pending = clarify.take_im_pending("weixin:u1", ttl_seconds=300)
     assert pending is not None
     assert pending.question == "选哪个?"
@@ -92,7 +95,8 @@ async def test_im_clarify_without_options_is_valid():
     await _stage(clarify)._prepare_clarify(
         _call({"question": "你想怎么做?"}), _event("weixin"),
     )
-    assert clarify.take_im_pending("weixin:u1", ttl_seconds=300) is not None
+    assert clarify.peek_im_pending("weixin:u1", 300, include_staged=True) is not None
+    assert clarify.take_im_pending("weixin:u1", ttl_seconds=300) is None
 
 
 # ── CLI path: no orphaned ClarifyRequest, no injected id ─────────────────────

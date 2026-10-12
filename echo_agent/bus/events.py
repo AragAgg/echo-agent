@@ -170,6 +170,7 @@ class InboundEvent:
     cron_authorized: bool = False  # this specific job passed the up-front cronjob approval
     # Authenticated native ingress only; gateway metadata cannot set this field.
     channel_verified: bool = False
+    clarification_answer: bool = False
     # Internal control command (e.g. the synthesized clarify-cancel on ws
     # disconnect). Like the trust signals above, this is a FIRST-CLASS typed
     # field — NOT a metadata key — precisely because it bypasses the session
@@ -263,6 +264,9 @@ class OutboundEvent:
     task_id: str | None = None
     workflow_id: str | None = None
     message_kind: str = "final"
+    # Internal delivery context; never forwarded as platform metadata. Recovery
+    # can report the eventual receipt against the original inbound event.
+    delivery_origin: InboundEvent | None = field(default=None, repr=False, compare=False)
 
     @property
     def text(self) -> str:

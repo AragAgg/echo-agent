@@ -5,7 +5,8 @@ import { relativeTime, fullTimestamp } from "../lib/datetime";
 import { statusMeta, useKanbanStore, canTransition, type TaskCard } from "../stores/kanban";
 import { useIsAdmin } from "../stores/capabilities";
 import { useConfirm } from "../components/ConfirmDialog";
-import { toast } from "../stores/toast";
+import { toast, runMutation } from "../stores/toast";
+import { apiFetch } from "../lib/api";
 
 /**
  * Right-hand drawer with a task's full record, plus the edit and cancel paths.
@@ -23,6 +24,33 @@ export function TaskDetailDrawer({ task, onClose }: { task: TaskCard; onClose: (
   const [editing, setEditing] = useState(false);
   const [saving, setSaving] = useState(false);
   const [actionBusy, setActionBusy] = useState(false);
+  const [answer, setAnswer] = useState("");
+  const question = detail.metadata?._clarification as { id?: string; channel?: string; options?: unknown[] } | undefined;
+  const choices = Array.isArray(question?.options) ? question.options.flatMap(option => {
+    if (typeof option === "string") return [{ label: option, answer: option }];
+    if (option && typeof option === "object" && "value" in option && option.value != null) {
+      const value = String(option.value);
+      const description = "description" in option ? String(option.description ?? "") : "";
+      return [{ label: description ? `${value} — ${description}` : value, answer: value }];
+    }
+    return [];
+  }) : [];
+  const awaitingAnswer = detail.status === "blocked" && detail.metadata?._awaiting_clarification === true
+    && question?.channel === "task" && typeof question.id === "string";
+  useEffect(() => setAnswer(""), [detail.id, question?.id]);
+  const submitAnswer = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!answer.trim() || actionBusy || !awaitingAnswer) return;
+    setActionBusy(true);
+    await runMutation(async () => {
+      const result = await apiFetch<{ task: TaskCard }>(`/tasks/${encodeURIComponent(detail.id)}/clarification`, {
+        method: "POST", body: JSON.stringify({ question_id: question.id, answer: answer.trim() }),
+      });
+      updateLocal(detail.id, result.task);
+      setAnswer("");
+    }, { success: t("detail.answerQueued"), error: t("detail.answerFailed") });
+    setActionBusy(false);
+  };
   const [form, setForm] = useState({
     title: detail.title,
     description: detail.description,
@@ -167,7 +195,7 @@ export function TaskDetailDrawer({ task, onClose }: { task: TaskCard; onClose: (
           ))}
         </div>
 
-        {!editing && canWrite && (
+        {!editing && canWrite && ["pending", "failed", "review"].includes(detail.status) && (
           <div className="flex flex-wrap gap-2 border-y py-3">
             {canTransition(detail.status, "queued") && detail.status === "pending" &&
               <ActionButton icon={<Play size={14} />} label={t("action.start")} disabled={actionBusy}
@@ -256,6 +284,19 @@ export function TaskDetailDrawer({ task, onClose }: { task: TaskCard; onClose: (
         <Field label={t("detail.result")} value={detail.result} mono />
         <Field label={t("detail.error")} value={detail.error} mono tone="error" />
         <Field label={t("detail.blockedReason")} value={detail.blocked_reason} />
+        {awaitingAnswer && canWrite && <form onSubmit={submitAnswer} className="space-y-2 rounded border border-blue-200 bg-blue-50 p-3">
+          <p className="text-sm text-blue-800">{t("detail.answerHint")}</p>
+          {choices.length > 0 && <div className="flex flex-wrap gap-2">
+            {choices.map((option, index) => <button key={index} type="button" disabled={actionBusy}
+              onClick={() => setAnswer(option.answer)} className="text-sm rounded border bg-white px-2 py-1 disabled:opacity-40">{option.label}</button>)}
+          </div>}
+          <label className="block text-sm">{t("detail.answerLabel")}
+            <textarea value={answer} onChange={e => setAnswer(e.target.value)} maxLength={10000} rows={3}
+              disabled={actionBusy} className="mt-1 w-full rounded border p-2" />
+          </label>
+          <button type="submit" disabled={actionBusy || !answer.trim()}
+            className="rounded bg-blue-600 px-3 py-1.5 text-sm text-white disabled:opacity-40">{t("detail.answerSubmit")}</button>
+        </form>}
         <Field label={t("detail.reviewSummary")} value={detail.review_summary} />
 
         <dl className="text-xs text-gray-500 space-y-1 border-t pt-3">

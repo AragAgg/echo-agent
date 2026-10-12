@@ -13,6 +13,7 @@ from loguru import logger
 from echo_agent.bus.events import OutboundEvent
 from echo_agent.bus.queue import MessageBus
 from echo_agent.channels.base import BaseChannel, SendResult
+from echo_agent.utils.text import split_message
 from echo_agent.config.schema import SlackChannelConfig
 
 _API_BASE = "https://slack.com/api"
@@ -67,18 +68,28 @@ class SlackChannel(BaseChannel):
         text = event.text or ""
         if not text:
             return None
-        payload: dict[str, Any] = {
-            "channel": event.chat_id,
-            "text": text,
-        }
-        thread_ts = event.metadata.get("thread_ts")
-        if thread_ts:
-            payload["thread_ts"] = thread_ts
-        result = await self._api("chat.postMessage", token=self._bot_token, json_body=payload)
-        if result and result.get("ok"):
-            return SendResult(success=True, message_id=str(result.get("ts", "")))
-        error = str(result.get("error", "Slack chat.postMessage failed")) if result else "Slack chat.postMessage failed"
-        return SendResult(success=False, error=error)
+        async def send_part(index, part):
+            payload: dict[str, Any] = {"channel": event.chat_id, "text": part}
+            thread_ts = event.metadata.get("thread_ts")
+            if thread_ts:
+                payload["thread_ts"] = thread_ts
+            result = await self._api("chat.postMessage", token=self._bot_token, json_body=payload)
+            warnings = result.get("response_metadata", {}).get("warnings", []) if result else []
+            if "message_truncated" in warnings:
+                return SendResult(success=False, error="Slack truncated this message; full delivery is unconfirmed",
+                                  delivery_unknown=True)
+            if result and result.get("ok"):
+                if not result.get("ts"):
+                    return SendResult(success=False, error="Slack send receipt missing", delivery_unknown=True)
+                return SendResult(success=True, message_id=str(result.get("ts", "")))
+            error = str(result.get("error", "Slack chat.postMessage failed")) if result else "Slack chat.postMessage failed"
+            return SendResult(success=False, error=error,
+                              delivery_unknown=result is None or error in {"internal_error", "request_timeout"})
+        async def before_send(index, part):
+            if index > 0:
+                await asyncio.sleep(1)
+        return await self.send_parts(event, split_message(text, 4000, preserve_whitespace=True),
+                                     send_part, before_send=before_send)
 
     async def edit_message(
         self,
@@ -103,7 +114,8 @@ class SlackChannel(BaseChannel):
         if result and result.get("ok"):
             return SendResult(success=True, message_id=str(result.get("ts") or message_id))
         error = str(result.get("error", "Slack chat.update failed")) if result else "Slack chat.update failed"
-        return SendResult(success=False, message_id=message_id, error=error)
+        return SendResult(success=False, message_id=message_id, error=error,
+                          delivery_unknown=result is None or error in {"internal_error", "request_timeout"})
 
     async def send_typing(self, chat_id: str, metadata: dict[str, Any] | None = None) -> None:
         thread_ts = (metadata or {}).get("thread_ts")
@@ -253,7 +265,7 @@ class SlackChannel(BaseChannel):
         channel_id = event.get("channel", "")
         channel_type = event.get("channel_type", "")
         text = event.get("text", "")
-        thread_ts = event.get("thread_ts") or event.get("ts", "")
+        thread_ts = event.get("thread_ts") or (event.get("ts", "") if channel_type != "im" else "")
 
         media: list[dict[str, str]] = []
         for f in event.get("files", []):

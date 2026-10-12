@@ -626,14 +626,16 @@ class WeixinChannel(BaseChannel):
             for b in blocks
         )
         if not has_media:
-            return await self._send_text(chat_id, event.text or "")
+            return await self._send_text(chat_id, event.text or "", event=event)
 
         all_ok = True
         last_error = ""
-        for block in blocks:
+        for index, block in enumerate(blocks):
             if block.type == ContentType.TEXT:
                 if block.text:
-                    res = await self._send_text(chat_id, block.text)
+                    res = await self._send_text(chat_id, block.text, event=OutboundEvent.text_reply(
+                        self.name, chat_id, block.text, event_id=f"{event.event_id}:block:{index}",
+                    ))
                     if not res.success:
                         all_ok, last_error = False, res.error
             elif block.type == ContentType.AUDIO and block.url:
@@ -649,14 +651,14 @@ class WeixinChannel(BaseChannel):
                     all_ok, last_error = False, res.error
         return SendResult(success=all_ok, error="" if all_ok else last_error)
 
-    async def _send_text(self, chat_id: str, text: str) -> SendResult:
+    async def _send_text(self, chat_id: str, text: str, *, event: OutboundEvent | None = None) -> SendResult:
         if not text:
             return SendResult(success=True, skipped=True)
         if not self._send_session or not self._token:
             return SendResult(success=False, error="no session or no token")
         context_token = self._token_store.get(self._account_id, chat_id)
         chunks = self._split_text(text)
-        for chunk in chunks:
+        async def send_part(index, chunk):
             try:
                 resp = await _send_message(
                     self._send_session,
@@ -667,19 +669,26 @@ class WeixinChannel(BaseChannel):
                     context_token=context_token,
                 )
                 failure = _require_ok(resp, what="sendmessage")
+                if not isinstance(resp, dict) or not any(key in resp for key in ("ret", "errcode")):
+                    return SendResult(success=False, error=failure or "Weixin acknowledgement missing", delivery_unknown=True)
                 if failure:
                     logger.warning("weixin send error: {}", failure)
                     return SendResult(success=False, error=failure)
             except Exception as exc:
-                logger.error("weixin send failed to {}: {}", chat_id[:8] if chat_id else "?", exc)
-                return SendResult(success=False, error=str(exc))
-            if len(chunks) > 1:
+                error = self.safe_delivery_error(exc)
+                logger.error("weixin send failed to {}: {}", chat_id[:8] if chat_id else "?", error)
+                return SendResult(success=False, error=error, delivery_unknown=True)
+            return SendResult(success=True)
+
+        async def before_send(index, chunk):
+            if index > 0:
                 await asyncio.sleep(0.3)
-        return SendResult(success=True)
+        event = event or OutboundEvent.text_reply(self.name, chat_id, text)
+        return await self.send_parts(event, chunks, send_part, before_send=before_send)
 
     @staticmethod
     def _split_text(text: str) -> list[str]:
-        return split_message(text, _MAX_MESSAGE_LENGTH)
+        return split_message(text, _MAX_MESSAGE_LENGTH, preserve_whitespace=True)
 
     # ── Typing indicator ───────────────────────────────────────────────────────
 

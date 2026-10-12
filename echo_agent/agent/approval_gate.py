@@ -199,6 +199,10 @@ class ApprovalGate:
         # turn must still be recognised as unattended via the cron/scheduler
         # fallback, even when the parent event's typed flag did not reach us.
         if self._is_unattended(event, channel, unattended=unattended):
+            # A board question is persisted on the task for an administrator to
+            # answer. It grants no tool permissions and sends no external message.
+            if tool_name == "clarify" and event is not None and event.channel == "task":
+                return _approved()
             if risk == RiskLevel.READ_ONLY:
                 return _approved()
             return self._resolve_unattended(

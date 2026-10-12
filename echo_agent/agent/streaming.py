@@ -30,6 +30,7 @@ class ProcessResult:
     task_incomplete: bool = False
     output_truncated: bool = False
     termination_reason: str = ""
+    delivery_result: DeliveryResult | None = None
 
 
 def channel_matches(channel: str, patterns: list[str]) -> bool:
@@ -237,10 +238,11 @@ class TokenStreamPublisher:
     async def _publish(
         self, text: str, *, is_final: bool, full_text: bool = False, reset: bool = False,
     ) -> "DeliveryResult":
-        from echo_agent.bus.events import OutboundEvent
+        from echo_agent.bus.events import InboundEvent, OutboundEvent
 
         if is_final and full_text:
             outbound = OutboundEvent.from_text_with_media(
+                event_id=f"reply:{self._event.event_id}",
                 channel=self._event.channel,
                 chat_id=self._event.chat_id,
                 text=text,
@@ -254,7 +256,12 @@ class TokenStreamPublisher:
                 reply_to_id=self._event.reply_to_id,
             )
         outbound.is_final = is_final
+        if is_final and isinstance(self._event, InboundEvent):
+            from dataclasses import replace
+            outbound.delivery_origin = replace(self._event, metadata=dict(self._event.metadata))
         outbound.message_kind = "final" if is_final else "streaming"
+        if is_final and self._event.metadata.get("_error_reason") == "awaiting_clarification":
+            outbound.message_kind = "clarification"
         outbound.metadata = dict(self._event.metadata)
         outbound.metadata["_inbound_event_id"] = self._event.event_id
         outbound.metadata["_token_stream"] = True

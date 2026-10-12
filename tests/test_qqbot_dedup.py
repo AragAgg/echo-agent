@@ -71,6 +71,9 @@ class _FakeResp:
         self.status = status
         self._body = body
 
+    async def json(self):
+        return {"id": "fixture-receipt"}
+
     async def __aenter__(self):
         return self
 

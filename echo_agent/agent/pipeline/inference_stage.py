@@ -255,10 +255,21 @@ class InferenceStage:
             # message is routed as its answer (see AgentLoop._on_inbound).
             session_key = getattr(event, "session_key", "")
             if session_key:
-                self._clarify.register_im_pending(
+                metadata = getattr(event, "metadata", None)
+                if metadata is None:
+                    metadata = event.metadata = {}
+                req = self._clarify.register_im_pending(
                     session_key, question, options,
                     user_id=getattr(event, "sender_id", ""),
+                    delivered=False,
+                    continuation={key: metadata[key] for key in ("task_id", "workflow_id")
+                                  if key in metadata},
                 )
+                event.metadata["_clarification"] = {
+                    "id": req.id, "channel": event.channel,
+                    "question": req.question, "options": req.options, "user_id": req.user_id,
+                    "session_key": session_key, "continuation": req.continuation,
+                }
             return
         req = self._clarify.request(
             question, options,
@@ -1283,10 +1294,16 @@ class InferenceStage:
         """
         _REPEAT_BLOCK_THRESHOLD = 4  # was a local in _run_tool_loop; value kept identical
         decisions: list[_Decision] = []
+        awaiting_answer = False
 
         # ---- Phase A: serial decision (approval / repeat / pre-hook) ----
         for tool_index, tool_call in enumerate(response.tool_calls):
             d = _Decision(tool_call=tool_call, index=tool_index, verdict="RUN")
+            if awaiting_answer:
+                d.verdict = "DEFERRED"
+                d.blocked_message = "Deferred until the user answers the clarification; this tool did not run."
+                decisions.append(d)
+                continue
             if ctx.execution_plan is not None:
                 for step in ctx.execution_plan.steps:
                     hint = (step.tool_hint or "").strip().lower()
@@ -1407,6 +1424,9 @@ class InferenceStage:
             if d.plan_step_index is not None:
                 ctx.execution_plan.mark_step_running(d.plan_step_index)
             decisions.append(d)
+            if (tool_call.name == "clarify" and not should_emit_cognitive(event.channel)
+                    and tool_obj is not None and not tool_obj.validate_params(tool_call.arguments)):
+                awaiting_answer = True
 
         # ---- Phase B: split RUN decisions into concurrent / serial groups ----
         run_decisions = [d for d in decisions if d.verdict == "RUN"]
@@ -1556,6 +1576,12 @@ class InferenceStage:
         # ---- Phase C: serial writeback in ORIGINAL tool_call order ----
         for d in decisions:
             tool_call = d.tool_call
+            if d.verdict == "DEFERRED":
+                messages.append({"role": "tool", "tool_call_id": tool_call.id,
+                                 "name": tool_call.name, "content": d.blocked_message})
+                session.add_message("tool", d.blocked_message,
+                                    tool_call_id=tool_call.id, name=tool_call.name)
+                continue
             tool_span = self._tracer.start_span(
                 trace_id, f"tool_{iteration}_{d.index}", f"tool:{tool_call.name}", "tool_call")
 
@@ -1644,6 +1670,8 @@ class InferenceStage:
                     counters.im_clarification_text = result_text
             elif result.is_infra_failure:
                 self._circuit_breaker.record_failure(tool_call.name)
+            if tool_call.name == "clarify" and not result.success and self._clarify is not None:
+                self._clarify.clear_im_pending(event.session_key)
 
             if d.plan_step_index is not None and ctx.execution_plan is not None:
                 if result.success:

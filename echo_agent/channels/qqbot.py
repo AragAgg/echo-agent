@@ -8,11 +8,15 @@ Supports media/file sending via the QQ rich media API (msg_type=7).
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import json
 import random
 import re
 import time
 from collections import OrderedDict
+from contextvars import ContextVar
+from pathlib import Path
 from typing import Any
 
 import aiohttp
@@ -128,6 +132,7 @@ class QQBotChannel(BaseChannel):
         # Strong refs for per-message tasks: a bare create_task result can be
         # garbage-collected mid-execution and is invisible to stop().
         self._msg_tasks: set[asyncio.Task] = set()
+        self._chunk_result: ContextVar[SendResult | None] = ContextVar("qqbot_chunk_result", default=None)
 
     def _spawn_msg_task(self, coro: Any) -> None:
         task = asyncio.create_task(coro)
@@ -250,6 +255,7 @@ class QQBotChannel(BaseChannel):
         await self._ensure_token()
         chat_id = event.chat_id
         msg_type = event.metadata.get("msg_type") or self._chat_type_map.get(chat_id, "group")
+        event.metadata.setdefault("msg_type", msg_type)
         msg_id = event.reply_to_id or ""
 
         send_queue: list[SendQueueItem] = []
@@ -273,39 +279,54 @@ class QQBotChannel(BaseChannel):
             if text:
                 send_queue.append(SendQueueItem(kind="text", content=text))
 
-        all_ok = True
+        parts, actions = [], []
         for i, item in enumerate(send_queue):
             reply = msg_id if i == 0 else ""
             if item.kind == "text":
-                # Downgrade GFM before splitting so QQ never shows raw markers
-                # (msg_type=0) or unsupported tables/headings/HR (msg_type=2).
-                # keep_inline follows the same capability check _send_chunk uses
-                # (global flag + channel type + per-target denial cache), so a
-                # target known to reject markdown gets inline markers stripped
-                # up front rather than leaking raw ** after the send downgrades.
-                keep_inline = self._markdown_allowed(chat_id, msg_type)
+                # Keep chunk boundaries stable when a target's markdown cache
+                # changes during a retry. The transport downgrades each chunk.
+                keep_inline = self._markdown and msg_type != "channel"
                 normalized = normalize_markdown(item.content, keep_inline=keep_inline)
                 chunks = self._split_text(normalized)
-                for j, chunk in enumerate(chunks):
-                    r = reply if j == 0 else ""
-                    ok = await self._send_chunk(chat_id, chunk, msg_type, r)
-                    if not ok:
-                        all_ok = False
-                    if len(chunks) > 1 and j < len(chunks) - 1:
-                        await asyncio.sleep(0.5)
+                for index, chunk in enumerate(chunks):
+                    parts.append(json.dumps(["text", chunk], ensure_ascii=False))
+                    actions.append(("text", chunk, reply if index == 0 else "", None))
             else:
-                ok = await self._send_media(chat_id, msg_type, item, reply)
-                if not ok:
-                    all_ok = False
-            if len(send_queue) > 1 and i < len(send_queue) - 1:
-                await asyncio.sleep(0.5)
+                digest = ""
+                prepared_file = None
+                if is_local_path(item.content):
+                    def fingerprint_file(source):
+                        with Path(source).open("rb") as file:
+                            data = file.read(self._max_file_size + 1)
+                        if not data or len(data) > self._max_file_size:
+                            raise ValueError("QQBot attachment is empty or exceeds the file size limit")
+                        return hashlib.sha256(data).hexdigest(), (base64.b64encode(data).decode("ascii"), Path(source).name)
+                    try:
+                        digest, prepared_file = await asyncio.to_thread(fingerprint_file, item.content)
+                    except (OSError, ValueError) as exc:
+                        return SendResult(success=False, error=self.safe_delivery_error(exc))
+                parts.append(json.dumps([item.kind, item.content, digest], ensure_ascii=False))
+                actions.append(("media", item, reply, prepared_file))
 
-        if not send_queue:
+        if not parts:
             return SendResult(success=False, error="empty send queue")
-        return SendResult(success=all_ok, error="" if all_ok else "one or more chunks failed")
+        async def send_part(index, part):
+            kind, payload, reply, prepared_file = actions[index]
+            self._chunk_result.set(None)
+            if kind == "text":
+                ok = await self._send_chunk(chat_id, payload, msg_type, reply)
+            else:
+                ok = await self._send_media(chat_id, msg_type, payload, reply, prepared_file=prepared_file) if prepared_file else await self._send_media(chat_id, msg_type, payload, reply)
+            return self._chunk_result.get() or SendResult(
+                success=ok, error="" if ok else "QQBot send outcome unknown", delivery_unknown=not ok)
+        async def before_send(index, part):
+            if index > 0:
+                await asyncio.sleep(0.5)
+        return await self.send_parts(event, parts, send_part, before_send=before_send)
 
     async def _send_media(
         self, chat_id: str, msg_type: str, item: SendQueueItem, reply_to: str,
+        *, prepared_file: tuple[str, str] | None = None,
     ) -> bool:
         if msg_type == "channel":
             logger.warning("QQBot: media not supported for channel type, sending as text")
@@ -316,13 +337,16 @@ class QQBotChannel(BaseChannel):
         scope = "c2c" if msg_type == "c2c" else "group"
         file_type = media_kind_to_file_type(item.kind)
         source = item.content
+        message_started = False
 
         try:
             url = ""
             file_data = ""
             file_name = ""
 
-            if is_http_source(source):
+            if prepared_file is not None:
+                file_data, file_name = prepared_file
+            elif is_http_source(source):
                 url = source
             elif is_data_source(source):
                 m = re.match(r"^data:[^;]+;base64,(.+)$", source, re.DOTALL)
@@ -343,12 +367,17 @@ class QQBotChannel(BaseChannel):
                 url=url, file_data=file_data, file_name=file_name,
                 cache=self._upload_cache,
             )
-            await send_media_message(
+            message_started = True
+            receipt = await send_media_message(
                 self._session, self._api_base, self._auth_headers(),
                 scope, chat_id, result["file_info"],
                 self._next_msg_seq(),
                 msg_id=reply_to,
             )
+            if not isinstance(receipt, dict) or not isinstance(receipt.get("id"), str) or not receipt["id"]:
+                self._chunk_result.set(SendResult(success=False, error="QQBot media receipt missing", delivery_unknown=True))
+                return False
+            self._chunk_result.set(SendResult(success=True, message_id=receipt["id"]))
             logger.info("QQBot media sent: {} → {}/{}", item.kind, scope, chat_id)
             return True
         except FileNotFoundError as e:
@@ -356,12 +385,14 @@ class QQBotChannel(BaseChannel):
             await self._send_chunk(
                 chat_id, f"[文件未找到] {source}", msg_type, reply_to,
             )
+            self._chunk_result.set(SendResult(success=False, error=str(e)))
             return False
         except Exception as e:
             logger.error("QQBot media send failed ({}): {}", item.kind, e)
             await self._send_chunk(
                 chat_id, f"[媒体发送失败] {e}", msg_type, reply_to,
             )
+            self._chunk_result.set(SendResult(success=False, error=self.safe_delivery_error(e), delivery_unknown=message_started))
             return False
 
     @staticmethod
@@ -404,6 +435,10 @@ class QQBotChannel(BaseChannel):
         return result
 
     async def _send_chunk(self, chat_id: str, text: str, msg_type: str, reply_to: str) -> bool:
+        self._chunk_result.set(None)
+        def failed(error, unknown=False):
+            self._chunk_result.set(SendResult(success=False, error=error, delivery_unknown=unknown))
+            return False
         seq = self._next_msg_seq()
         using_markdown = self._markdown_allowed(chat_id, msg_type)
         if msg_type == "channel":
@@ -419,7 +454,7 @@ class QQBotChannel(BaseChannel):
             if using_markdown:
                 payload = {"markdown": {"content": text}, "msg_type": 2, "msg_seq": seq}
             else:
-                payload = {"content": text, "msg_type": 0, "msg_seq": seq}
+                payload = {"content": self._plain_chunk(text), "msg_type": 0, "msg_seq": seq}
             if reply_to:
                 payload["msg_id"] = reply_to
 
@@ -431,6 +466,10 @@ class QQBotChannel(BaseChannel):
             try:
                 async with self._session.post(url, json=payload, headers=self._auth_headers()) as resp:
                     if resp.status < 400:
+                        data = await resp.json()
+                        if not isinstance(data, dict) or not isinstance(data.get("id"), str) or not data["id"]:
+                            return failed("QQBot send receipt missing", unknown=True)
+                        self._chunk_result.set(SendResult(success=True, message_id=data["id"]))
                         return True
                     body = await resp.text()
                     if resp.status == 400 and "40034024" in body and "msg_id" in payload:
@@ -439,7 +478,7 @@ class QQBotChannel(BaseChannel):
                         # but cap it so we can't loop forever.
                         if msg_id_drops >= 1:
                             logger.warning("QQBot msg_id drop already attempted; giving up")
-                            return False
+                            return failed("QQBot reply reference rejected")
                         msg_id_drops += 1
                         logger.info("QQBot msg_id expired, retrying without reply reference")
                         payload.pop("msg_id", None)
@@ -450,7 +489,7 @@ class QQBotChannel(BaseChannel):
                         # so a misconfigured app_id can't spin forever.
                         if token_refreshes >= 2:
                             logger.warning("QQBot 401 persists after token refresh; giving up")
-                            return False
+                            return failed("QQBot authentication rejected")
                         token_refreshes += 1
                         logger.info("QQBot token expired during send, refreshing")
                         self._token_expires = 0
@@ -468,11 +507,11 @@ class QQBotChannel(BaseChannel):
                         # budget; cap it so a persistent 400 can't loop.
                         if md_downgrades >= 1:
                             logger.warning("QQBot markdown downgrade already attempted; giving up")
-                            return False
+                            return failed("QQBot message format rejected")
                         md_downgrades += 1
                         self._mark_markdown_unsupported(chat_id)
                         using_markdown = False
-                        plain = normalize_markdown(text, keep_inline=False)
+                        plain = self._plain_chunk(text)
                         payload = {"content": plain, "msg_type": 0, "msg_seq": seq}
                         if reply_to:
                             payload["msg_id"] = reply_to
@@ -483,18 +522,31 @@ class QQBotChannel(BaseChannel):
                         continue
                     if resp.status in (400, 403, 404):
                         logger.warning("QQBot send permanent error ({}): {}", resp.status, body[:200])
-                        return False
+                        return failed(f"QQBot HTTP {resp.status}: {body[:200]}")
+                    if resp.status >= 500:
+                        return failed(f"QQBot HTTP {resp.status}: outcome unknown", unknown=True)
+                    if resp.status != 429:
+                        return failed(f"QQBot HTTP {resp.status}: request rejected")
                     logger.warning("QQBot send error ({}), retry {}/{}: {}", resp.status, attempt + 1, _SEND_RETRIES, body[:200])
             except Exception as e:
-                logger.error("QQBot send exception, retry {}/{}: {}", attempt + 1, _SEND_RETRIES, e)
+                logger.error("QQBot send exception ({})", type(e).__name__)
+                return failed(f"QQBot transport failure ({type(e).__name__})", unknown=True)
             attempt += 1
             if attempt < _SEND_RETRIES:
                 await asyncio.sleep(1 * attempt)
-        return False
+        return failed("QQBot rate limit retry budget exhausted")
+
+    @staticmethod
+    def _plain_chunk(text: str) -> str:
+        if not text.strip():
+            return text
+        leading = text[:len(text) - len(text.lstrip())]
+        trailing = text[len(text.rstrip()):]
+        return leading + normalize_markdown(text, keep_inline=False) + trailing
 
     @staticmethod
     def _split_text(text: str) -> list[str]:
-        return split_message(text, _MAX_MESSAGE_LENGTH)
+        return split_message(text, _MAX_MESSAGE_LENGTH, preserve_whitespace=True)
 
     # ── WebSocket ────────────────────────────────────────────────────────────
 

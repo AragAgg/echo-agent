@@ -56,10 +56,10 @@ class TurnRunStore:
         acknowledged or uncertain send. Only a definite rejection is releasable.
         """
         changed = await self._storage.execute_sql(
-            "INSERT INTO outbound_parts(part_id,fingerprint) SELECT ?,? "
+            "INSERT INTO outbound_parts(part_id,fingerprint,state,updated_at) SELECT ?,?,'inflight',? "
             "WHERE (SELECT COUNT(*) FROM outbound_parts) < ? "
             "ON CONFLICT(part_id) DO NOTHING",
-            (part_id, fingerprint, self._MAX_OUTBOUND_PARTS),
+            (part_id, fingerprint, self._clock(), self._MAX_OUTBOUND_PARTS),
         )
         if changed is None:
             raise RuntimeError("outbound storage cannot arbitrate delivery")
@@ -78,11 +78,109 @@ class TurnRunStore:
             )
         else:
             changed = await self._storage.execute_sql(
-                "UPDATE outbound_parts SET message_id=? WHERE part_id=? AND message_id=''",
-                (message_id, part_id),
+                "UPDATE outbound_parts SET message_id=?,state='delivered',updated_at=? WHERE part_id=? AND message_id=''",
+                (message_id, self._clock(), part_id),
             )
             if changed != 1:
                 raise RuntimeError("outbound receipt was not persisted")
+
+    async def mark_outbound_unknown(self, part_id: str) -> None:
+        await self._storage.execute_sql(
+            "UPDATE outbound_parts SET state='unknown',updated_at=? WHERE part_id=? AND message_id=''",
+            (self._clock(), part_id),
+        )
+
+    async def register_outbound(self, event) -> None:
+        from dataclasses import asdict
+        values = {
+            "event_id": event.event_id, "channel": event.channel, "chat_id": event.chat_id,
+            "content": [asdict(block) for block in event.content], "reply_to_id": event.reply_to_id,
+            "metadata": {key: value for key, value in event.metadata.items()
+                         if not key.startswith("_") or key in {"_inbound_event_id", "_clarification"}},
+            "message_kind": event.message_kind,
+        }
+        if event.delivery_origin is not None:
+            origin = asdict(event.delivery_origin)
+            origin["timestamp"] = event.delivery_origin.timestamp.isoformat()
+            values["delivery_origin"] = origin
+        payload = json.dumps(values, ensure_ascii=False, sort_keys=True)
+        await self._storage.execute_sql(
+            "INSERT INTO outbound_messages(event_id,payload,created_at,updated_at) SELECT ?,?,?,? "
+            "WHERE (SELECT COUNT(*) FROM outbound_messages) < ? "
+            "ON CONFLICT(event_id) DO NOTHING",
+            (event.event_id, payload, self._clock(), self._clock(), self._MAX_OUTBOUND_PARTS),
+        )
+        rows = await self._storage.fetch_sql("SELECT payload FROM outbound_messages WHERE event_id=?", (event.event_id,))
+        if not rows:
+            raise RuntimeError("outbound recovery ledger is full")
+        if rows[0]["payload"] != payload:
+            raise RuntimeError("outbound delivery identity conflict")
+
+    async def update_outbound(self, event_id: str, status: str, error: str = "") -> None:
+        await self._storage.execute_sql(
+            "UPDATE outbound_messages SET status=?,error=?,updated_at=? WHERE event_id=?",
+            (status, error, self._clock(), event_id),
+        )
+
+    async def list_outbound(self, *, limit: int = 100) -> list[dict]:
+        rows = await self._storage.fetch_sql(
+            "SELECT * FROM outbound_messages WHERE status!='delivered' ORDER BY created_at DESC LIMIT ?",
+            (max(1, min(limit, 100)),),
+        )
+        result = []
+        for row in rows:
+            payload = json.loads(row["payload"])
+            parts = await self.outbound_parts(row["event_id"], payload["channel"])
+            result.append({**row, "payload": payload, "parts": parts})
+        return result
+
+    async def outbound_parts(self, event_id: str, channel: str) -> list[dict]:
+        prefix = f"{channel}:{event_id}:"
+        escaped = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        return await self._storage.fetch_sql(
+            "SELECT part_id,state,message_id FROM outbound_parts WHERE part_id LIKE ? ESCAPE '\\'",
+            (escaped + "%",),
+        )
+
+    async def get_outbound_event(self, event_id: str):
+        from datetime import datetime
+        from echo_agent.bus.events import ContentBlock, ContentType, EventType, InboundEvent, OutboundEvent
+        rows = await self._storage.fetch_sql("SELECT payload FROM outbound_messages WHERE event_id=?", (event_id,))
+        if not rows:
+            return None
+        payload = json.loads(rows[0]["payload"])
+        payload["content"] = [ContentBlock(**{**block, "type": ContentType(block["type"])}) for block in payload["content"]]
+        origin = payload.get("delivery_origin")
+        if origin is not None:
+            origin["timestamp"] = datetime.fromisoformat(origin["timestamp"])
+            origin["event_type"] = EventType(origin["event_type"])
+            origin["content"] = [ContentBlock(**{**block, "type": ContentType(block["type"])}) for block in origin["content"]]
+            payload["delivery_origin"] = InboundEvent(**origin)
+        return OutboundEvent(**payload)
+
+    async def resolve_outbound(self, event_id: str, *, confirmed_not_delivered: bool = False,
+                               message_ids: dict[str, str] | None = None, actor: str = "operator") -> None:
+        event = await self.get_outbound_event(event_id)
+        if event is None:
+            raise ValueError("outbound message not found")
+        pending = [row for row in await self.outbound_parts(event_id, event.channel) if not row["message_id"]]
+        if any(row["state"] == "inflight" for row in pending):
+            raise ValueError("delivery is still in progress")
+        if pending and not confirmed_not_delivered and not message_ids:
+            raise ValueError("confirm the platform outcome before retrying an unknown delivery")
+        for row in pending:
+            receipt = (message_ids or {}).get(row["part_id"])
+            if receipt is not None and (not isinstance(receipt, str) or not receipt.strip() or len(receipt) > 500):
+                raise ValueError("a non-empty platform receipt is required")
+            if receipt is None and not confirmed_not_delivered:
+                raise ValueError("a platform receipt is required for every unknown part")
+        for row in pending:
+            receipt = (message_ids or {}).get(row["part_id"])
+            await self._storage.execute_sql(
+                "INSERT INTO outbound_resolutions(part_id,action,message_id,resolved_at,actor) VALUES (?,?,?,?,?)",
+                (row["part_id"], "confirmed_delivered" if receipt else "confirmed_not_delivered", receipt or "", self._clock(), actor),
+            )
+            await self.finish_outbound_part(row["part_id"], receipt)
 
     async def _emit(self, event_id: str) -> None:
         if self._event_sink is None:
@@ -378,6 +476,14 @@ class TurnRunStore:
         acceptance but before dispatch leaves the same false "still running"
         experience on reconnect.
         """
+        await self._storage.execute_sql(
+            "UPDATE outbound_parts SET state='unknown',updated_at=? WHERE state='inflight' AND message_id=''",
+            (self._clock(),),
+        )
+        await self._storage.execute_sql(
+            "UPDATE outbound_messages SET status='unknown',updated_at=? WHERE status IN ('pending','retrying')",
+            (self._clock(),),
+        )
         rows = await self._storage.fetch_sql(
             "SELECT COUNT(*) AS count FROM turn_runs "
             "WHERE status NOT IN ('completed','incomplete','failed','interrupted')",

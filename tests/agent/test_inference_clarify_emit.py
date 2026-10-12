@@ -91,6 +91,8 @@ async def test_prepare_clarify_noop_on_non_cli_channel():
     assert cog.emitted == []
     # ...but the question is remembered per session so the next inbound message
     # can be routed to it as the answer (IM follow-up continuation).
+    assert mgr.take_im_pending("wecom:u1", ttl_seconds=300) is None
+    mgr.confirm_im_delivery("wecom:u1")
     pending = mgr.take_im_pending("wecom:u1", ttl_seconds=300)
     assert pending is not None
     assert pending.question == "q"

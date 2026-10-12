@@ -11,6 +11,35 @@
   "enabledSuccess": "Channel enabled",
   "disabledSuccess": "Channel disabled",
   "toggleFailed": "Failed to update channel configuration",
-  "actionSuccess": { "start": "Channel started", "stop": "Channel stopped", "restart": "Channel restarted" },
-  "actionFailed": { "start": "Channel failed to start", "stop": "Channel failed to stop", "restart": "Channel failed to restart" }
+  "actionSuccess": {
+    "start": "Channel started",
+    "stop": "Channel stopped",
+    "restart": "Channel restarted"
+  },
+  "actionFailed": {
+    "start": "Channel failed to start",
+    "stop": "Channel failed to stop",
+    "restart": "Channel failed to restart"
+  },
+  "delivery": {
+    "title": "Delivery recovery",
+    "refresh": "Refresh records",
+    "description": "Confirmed parts will not be sent again. Check the destination chat before recovering an uncertain delivery.",
+    "empty": "No deliveries need attention",
+    "retry": "Continue sending missing content",
+    "sending": "Sending…",
+    "confirm": "Entire message received",
+    "retryTitle": "Confirm the remaining content was not delivered",
+    "retryWarning": "Check the destination chat first. Confirmed parts will be skipped. Continue only after verifying that the uncertain parts were not delivered, to avoid duplicates.",
+    "retryChecked": "Not delivered — continue",
+    "confirmTitle": "Record the entire message as delivered",
+    "confirmWarning": "Confirm that the recipient received the entire message and all attachments. Recording this outcome stops further retries.",
+    "confirmChecked": "Entire message received",
+    "parts": "{{count}} confirmed parts · {{files}} attachments",
+    "unknown": "Some delivery results are uncertain and need verification.",
+    "unsent": "Some content was not delivered. Continue after the confirmed parts.",
+    "success": "Delivery record updated",
+    "failed": "Delivery recovery did not complete",
+    "viewFull": "View the full message and attachment names"
+  }
 }

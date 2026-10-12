@@ -176,9 +176,13 @@ class ChannelManager:
 
     async def _filter_and_dispatch(self, event: OutboundEvent) -> SendResult | None:
         if event.metadata.get("_token_stream"):
-            await self._handle_token_stream(event)
+            result = await self._handle_token_stream(event)
             if event.metadata.get("_drop"):
-                return
+                if event.is_final:
+                    if result is not None and not result.success:
+                        event.metadata["_error"] = True
+                    await self._on_outbound_final(event)
+                return result
 
         if event.metadata.get("_heartbeat"):
             await self._handle_heartbeat(event)
@@ -198,7 +202,7 @@ class ChannelManager:
                 event.metadata["_drop"] = True
                 return
 
-        if event.is_final and event.message_kind == "final":
+        if event.is_final and event.message_kind in {"final", "clarification"}:
             result = None
             if not event.metadata.get("_token_stream"):
                 result = await self._deliver_final(event)
@@ -298,19 +302,23 @@ class ChannelManager:
         key = str(event.metadata.get("_inbound_event_id", ""))
         target = f"{event.channel}:{event.chat_id}"
         is_tool_delivery = bool(event.metadata.get("_tool_delivery"))
+        is_clarification = event.message_kind == "clarification"
+        is_retry = event.metadata.get("_delivery_retry") is True
         artifact_parts = self._artifact_multipart_position(event)
         # A partial text fallback is not a completed delivery.  Claiming the
         # target after part 1 meant a later transport failure on part 2 caused
         # the turn's truthful failure summary to be suppressed as a duplicate.
         # Malformed/unmarked tool events retain the established single-message
         # behaviour; only a well-formed multipart artifact defers its claim.
-        claims_target_on_success = artifact_parts is None or artifact_parts[0] == artifact_parts[1]
+        claims_target_on_success = not is_clarification and (
+            artifact_parts is None or artifact_parts[0] == artifact_parts[1]
+        )
 
         if key:
             async with self._state_lock:
                 claimed = self._finalized_targets.setdefault(key, set())
                 already_delivered = target in claimed
-            if already_delivered and not is_tool_delivery:
+            if already_delivered and not is_tool_delivery and not is_clarification and not is_retry:
                 logger.debug(
                     "Suppressing duplicate final for {} (already delivered by a tool this turn)",
                     target,
@@ -344,18 +352,25 @@ class ChannelManager:
 
         # If a heartbeat already occupies a message on an editable channel, seal
         # the final answer into that same message so the turn uses one slot total.
-        if key and getattr(channel, "supports_edit", False):
+        if (key and not is_clarification and not any(block.url for block in event.content)
+                and getattr(channel, "supports_edit", False)):
             async with self._state_lock:
                 hb_msg_id = self._heartbeat_msg_ids.get(key)
             if hb_msg_id:
                 try:
-                    result = await channel.edit_message(
-                        event.chat_id,
-                        hb_msg_id,
-                        event.text,
-                        metadata=self._public_metadata(event.metadata),
-                        finalize=True,
-                    )
+                    async def seal_final(index, part):
+                        return await channel.edit_message(
+                            event.chat_id, hb_msg_id, part,
+                            metadata=self._public_metadata(event.metadata), finalize=True,
+                        )
+                    if isinstance(channel, BaseChannel):
+                        result = await channel.send_parts(event, [event.text], seal_final,
+                                                          namespace="heartbeat-edit", force_checkpoint=True)
+                    else:
+                        result = await seal_final(0, event.text)
+                    if result is None or result.delivery_unknown:
+                        event.metadata["_drop"] = True
+                        return result or SendResult(success=False, error="final edit result unknown", delivery_unknown=True)
                     if result and not result.success:
                         logger.warning("Final seal-edit failed on {}: {}", event.channel, result.error)
                         await self._delete_stale_heartbeat(channel, event, hb_msg_id)
@@ -392,20 +407,24 @@ class ChannelManager:
             reply_to_id=event.reply_to_id,
         )
         send_event.is_final = True
-        send_event.message_kind = "final"
+        send_event.delivery_origin = event.delivery_origin
+        send_event.message_kind = event.message_kind
         send_event.metadata = self._public_metadata(event.metadata)
         try:
             result = await channel.send(send_event)
         except Exception as e:
             logger.error("Final delivery exception on {}: {}", event.channel, e)
             # Transport threw — leave the target unclaimed so a retry can try
-            # again. Do NOT mark _drop; the caller's retry path needs this event.
+            # again. Drop the specific-handler pass to avoid a second send in
+            # this same publish; an explicit retry uses the saved event instead.
+            event.metadata["_drop"] = True
             return SendResult(success=False, error=str(e))
         if result and not result.success:
             logger.warning("Final delivery failed on {}: {}", event.channel, result.error)
             # Channel refused (transport returned a non-success receipt).
             # Leave the target unclaimed — a later retry of this same turn, if
             # the framework invokes one, has room to try again.
+            event.metadata["_drop"] = True
             return result
         # Success receipt. Commit the claim so subsequent finals to the same
         # target within this turn are deduped (the duplicate-final bug the
@@ -539,7 +558,7 @@ class ChannelManager:
         elif result and not result.success:
             logger.info("heartbeat send failed: channel={} error={}", event.channel, getattr(result, "error", ""))
 
-    async def _handle_token_stream(self, event: OutboundEvent) -> None:
+    async def _handle_token_stream(self, event: OutboundEvent) -> SendResult | None:
         channel = self._channels.get(event.channel)
         if channel is None:
             return
@@ -566,9 +585,10 @@ class ChannelManager:
 
         if state.failed:
             if event.is_final:
-                await self._send_stream_fallback(channel, event, visible_text)
+                result = await self._send_stream_fallback(channel, event, visible_text)
                 async with self._state_lock:
                     self._stream_states.pop(stream_key, None)
+                return result
             return
 
         rendered_text = self._render_stream_text(visible_text, final=event.is_final)
@@ -582,24 +602,29 @@ class ChannelManager:
             if event.is_final:
                 async with self._state_lock:
                     self._stream_states.pop(stream_key, None)
-            return
+            return SendResult(success=True, message_id=state.message_id or "")
 
         if state.message_id:
-            result = await channel.edit_message(
-                event.chat_id,
-                state.message_id,
-                rendered_text,
-                metadata=self._public_metadata(event.metadata),
-                finalize=event.is_final,
-            )
+            async def edit_final(index, part):
+                return await channel.edit_message(
+                    event.chat_id, state.message_id, part,
+                    metadata=self._public_metadata(event.metadata), finalize=event.is_final,
+                )
+            if event.is_final and isinstance(channel, BaseChannel):
+                result = await channel.send_parts(event, [rendered_text], edit_final,
+                                                  namespace="stream-edit", force_checkpoint=True)
+            else:
+                result = await edit_final(0, rendered_text)
         else:
             send_event = OutboundEvent.text_reply(
+                event_id=event.event_id,
                 channel=event.channel,
                 chat_id=event.chat_id,
                 text=rendered_text,
                 reply_to_id=event.reply_to_id,
             )
             send_event.is_final = event.is_final
+            send_event.delivery_origin = event.delivery_origin
             send_event.message_kind = event.message_kind
             send_event.metadata = self._public_metadata(event.metadata)
             result = await channel.send(send_event)
@@ -609,10 +634,11 @@ class ChannelManager:
             logger.warning("Token stream delivery failed on {}: {}", event.channel, error)
             state.failed = True
             if event.is_final:
-                await self._send_stream_fallback(channel, event, visible_text)
+                if result is None or not result.delivery_unknown:
+                    result = await self._send_stream_fallback(channel, event, visible_text)
                 async with self._state_lock:
                     self._stream_states.pop(stream_key, None)
-            return
+            return result or SendResult(success=False, delivery_unknown=True, error=error)
 
         if result.message_id:
             state.message_id = result.message_id
@@ -625,23 +651,27 @@ class ChannelManager:
         if event.is_final:
             async with self._state_lock:
                 self._stream_states.pop(stream_key, None)
+        return result
 
-    async def _send_stream_fallback(self, channel: BaseChannel, event: OutboundEvent, text: str) -> None:
+    async def _send_stream_fallback(self, channel: BaseChannel, event: OutboundEvent, text: str) -> SendResult:
         final_text = self._render_stream_text(text, final=True)
         if not final_text:
-            return
+            return SendResult(success=True)
         fallback = OutboundEvent.text_reply(
+            event_id=event.event_id,
             channel=event.channel,
             chat_id=event.chat_id,
             text=final_text,
             reply_to_id=event.reply_to_id,
         )
         fallback.is_final = True
-        fallback.message_kind = "final"
+        fallback.delivery_origin = event.delivery_origin
+        fallback.message_kind = event.message_kind
         fallback.metadata = self._public_metadata(event.metadata)
         result = await channel.send(fallback)
         if result and not result.success:
             logger.warning("Token stream fallback send failed on {}: {}", event.channel, result.error)
+        return result or SendResult(success=False, delivery_unknown=True, error="channel returned no send result")
 
     @staticmethod
     def _stream_key(event: OutboundEvent) -> str:
@@ -651,7 +681,8 @@ class ChannelManager:
     @staticmethod
     def _public_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
         # Preserve _inbound_event_id: webhook wait=true needs it for correlation.
-        return {key: value for key, value in metadata.items() if not key.startswith("_") or key == "_inbound_event_id"}
+        return {key: value for key, value in metadata.items()
+                if not key.startswith("_") or key in {"_inbound_event_id", "_clarification"}}
 
     @staticmethod
     def _visible_stream_text(text: str, *, final: bool) -> str:

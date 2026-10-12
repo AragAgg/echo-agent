@@ -9,6 +9,7 @@ from loguru import logger
 
 from echo_agent.agent.pipeline.types import InferenceResult, PipelineContext
 from echo_agent.bus.events import stamp_turn_outcome
+from echo_agent.bus.delivery import DeliveryResult
 from echo_agent.utils.text import strip_thinking
 
 if TYPE_CHECKING:
@@ -31,6 +32,7 @@ class ProcessResult:
     task_incomplete: bool = False
     output_truncated: bool = False
     termination_reason: str = ""
+    delivery_result: DeliveryResult | None = None
 
 
 # Channels whose traffic is synthetic (evaluation/benchmark/test harnesses) and
@@ -211,6 +213,7 @@ class ResponseStage:
 
         # Finalize streaming
         outbound_sent = False
+        receipt = None
         if ctx.publish_response and ctx.stream_publisher:
             if result.task_incomplete:
                 status = (
@@ -262,6 +265,7 @@ class ResponseStage:
             task_incomplete=result.task_incomplete,
             output_truncated=result.output_truncated,
             termination_reason=result.termination_reason,
+            delivery_result=receipt,
         )
 
     def _update_working_memory(self, session_key: str, event: Any, response_text: str) -> None:

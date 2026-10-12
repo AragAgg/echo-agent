@@ -310,6 +310,16 @@ _MIGRATIONS: list[tuple[int, str]] = [
         message_id TEXT NOT NULL DEFAULT ''
     )""",
     ),
+    (36, "ALTER TABLE outbound_parts ADD COLUMN state TEXT NOT NULL DEFAULT 'unknown'"),
+    (37, "ALTER TABLE outbound_parts ADD COLUMN updated_at REAL NOT NULL DEFAULT 0"),
+    (38, """CREATE TABLE IF NOT EXISTS outbound_messages (
+        event_id TEXT PRIMARY KEY, payload TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending', error TEXT NOT NULL DEFAULT '',
+        created_at REAL NOT NULL, updated_at REAL NOT NULL)"""),
+    (39, """CREATE TABLE IF NOT EXISTS outbound_resolutions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, part_id TEXT NOT NULL,
+        action TEXT NOT NULL, message_id TEXT NOT NULL, resolved_at REAL NOT NULL)"""),
+    (40, "ALTER TABLE outbound_resolutions ADD COLUMN actor TEXT NOT NULL DEFAULT ''"),
 ]
 
 

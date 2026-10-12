@@ -25,6 +25,7 @@ def register_management_routes(app: web.Application, prefix: str, server: Gatewa
     from echo_agent.gateway.api.cron_api import CronAPI
     from echo_agent.gateway.api.logs import LogsAPI
     from echo_agent.gateway.api.analytics import AnalyticsAPI
+    from echo_agent.gateway.api.deliveries import DeliveriesAPI
 
     memory_api = MemoryAPI(server)
     skills_api = SkillsAPI(server)
@@ -36,6 +37,10 @@ def register_management_routes(app: web.Application, prefix: str, server: Gatewa
     cron_api = CronAPI(server)
     logs_api = LogsAPI(server)
     analytics_api = AnalyticsAPI(server)
+    deliveries_api = DeliveriesAPI(server)
+    app.router.add_get(f"{prefix}/deliveries", deliveries_api.list_messages)
+    app.router.add_get(f"{prefix}/deliveries/{{id}}", deliveries_api.message_detail)
+    app.router.add_post(f"{prefix}/deliveries/{{id}}/recover", deliveries_api.recover)
 
     app.router.add_get(f"{prefix}/memory", memory_api.list_entries)
     app.router.add_get(f"{prefix}/memory/stats", memory_api.stats)
@@ -80,6 +85,7 @@ def register_management_routes(app: web.Application, prefix: str, server: Gatewa
     app.router.add_delete(f"{prefix}/tasks/{{id}}", tasks_api.delete_task)
     app.router.add_post(f"{prefix}/tasks/{{id}}/transition", tasks_api.transition_task)
     app.router.add_post(f"{prefix}/tasks/{{id}}/retry", tasks_api.retry_task)
+    app.router.add_post(f"{prefix}/tasks/{{id}}/clarification", tasks_api.answer_clarification)
 
     app.router.add_get(f"{prefix}/sessions", sessions_api.list_sessions)
     app.router.add_get(f"{prefix}/sessions/{{key}}/history", sessions_api.get_history)

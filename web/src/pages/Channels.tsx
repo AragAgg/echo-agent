@@ -7,6 +7,7 @@ import { useIsAdmin } from "../stores/capabilities";
 import { Loadable } from "../components/Loadable";
 import { RefreshCw, Power, RotateCw } from "lucide-react";
 import { useState } from "react";
+import { DeliveryRecovery } from "../components/DeliveryRecovery";
 
 interface Channel {
   name: string;
@@ -19,7 +20,8 @@ interface Channel {
 export function Channels() {
   const { t } = useTranslation(["channels", "common"]);
   const { data, loading, error, refetch } = useApi<{ channels: Channel[] }>("/channels");
-  const canWrite = useIsAdmin() !== false;
+  const isAdmin = useIsAdmin();
+  const canWrite = isAdmin !== false;
   const [inflight, setInflight] = useState<string | null>(null);
 
   useWsSubscribe(["channels"], () => refetch(), ["channel_updated"]);
@@ -118,6 +120,7 @@ export function Channels() {
           </div>
         )}
       </Loadable>
+      {isAdmin === true && <DeliveryRecovery />}
     </div>
   );
 }

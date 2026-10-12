@@ -7,7 +7,7 @@ from echo_agent.agent.progress_heartbeat import SharedActivityState
 from echo_agent.agent.pipeline.types import PipelineContext
 from echo_agent.models.provider import LLMResponse
 
-from test_inference_stage import _make_stage, _make_ctx
+from tests.test_inference_stage import _make_stage, _make_ctx
 
 
 def test_pipeline_context_has_activity_field():

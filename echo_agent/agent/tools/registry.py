@@ -108,6 +108,14 @@ class ToolRegistry:
         # 动态注册的 MCP 工具——逐工具打补丁覆盖不到它们。未装配时是 no-op。
         self._spill_policy = spill_policy
         self._skill_usage_recorder: Callable[[str, bool], Awaitable[None]] | None = None
+        self._execution_guard: Callable[[], None] | None = None
+
+    def set_execution_guard(self, guard: Callable[[], None]) -> None:
+        self._execution_guard = guard
+
+    def assert_execution_healthy(self) -> None:
+        if self._execution_guard is not None:
+            self._execution_guard()
 
     def set_skill_usage_recorder(
         self,
@@ -179,6 +187,17 @@ class ToolRegistry:
     def unregister(self, name: str) -> None:
         self._tools.pop(name, None)
 
+    def replace_group(self, old_names: list[str], tools: list[Tool]) -> None:
+        """Validate the complete replacement before publishing one new directory."""
+        replacement = ToolRegistry()
+        if len({tool.name for tool in tools}) != len(tools):
+            raise ValueError("replacement directory contains duplicate tool names")
+        removed = set(old_names)
+        replacement._tools = {name: tool for name, tool in self._tools.items() if name not in removed}
+        for tool in tools:
+            replacement.register(tool)
+        self._tools = replacement._tools
+
     def get(self, name: str) -> Tool | None:
         return self._tools.get(self._resolve(name))
 
@@ -186,6 +205,7 @@ class ToolRegistry:
         return self._resolve(name) in self._tools
 
     def get_definitions(self, channel: str | None = None) -> list[dict[str, Any]]:
+        self.assert_execution_healthy()
         definitions: list[dict[str, Any]] = []
         for tool in self._tools.values():
             if self._config is not None:
@@ -200,6 +220,7 @@ class ToolRegistry:
 
     def get_ready_definitions(self, channel: str | None = None) -> list[dict[str, Any]]:
         """Like get_definitions() but only includes tools where is_ready() is True."""
+        self.assert_execution_healthy()
         definitions: list[dict[str, Any]] = []
         for tool in self._tools.values():
             if not tool.is_ready():
@@ -234,6 +255,7 @@ class ToolRegistry:
         *,
         replay_scope: str = "",
     ) -> ToolResult:
+        self.assert_execution_healthy()
         resolved_name = self._resolve(name)
         if ctx and ctx.allowed_tools and resolved_name not in ctx.allowed_tools:
             return ToolResult(success=False, error=f"Tool '{name}' is outside the scoped tool allowlist")
@@ -287,6 +309,7 @@ class ToolRegistry:
         last_result = ToolResult(success=False, error="no attempt made")
 
         while attempt < max_attempts:
+            self.assert_execution_healthy()
             try:
                 result = await asyncio.wait_for(
                     tool.execute(params, exec_ctx),

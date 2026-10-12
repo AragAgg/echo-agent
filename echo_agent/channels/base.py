@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+import asyncio
+import json
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -31,6 +33,11 @@ class SendResult:
     deferred: bool = False
     # Multipart receipts include acknowledged parts even when a later part fails.
     message_ids: list[str] = field(default_factory=list)
+    delivery_unknown: bool = False
+
+
+class DeliveryRejected(RuntimeError):
+    """A request was explicitly refused and can safely be retried."""
 
 
 class BaseChannel(ABC):
@@ -80,6 +87,121 @@ class BaseChannel(ABC):
     @abstractmethod
     async def send(self, event: OutboundEvent) -> SendResult | None:
         """Send a message through this channel."""
+
+    async def send_parts(self, event: OutboundEvent, parts: list[str], sender,
+                         *, fingerprint: str = "", namespace: str = "", before_send=None,
+                         require_durable: bool = False, force_checkpoint: bool = False) -> SendResult:
+        """Serialize each chat's reply and checkpoint confirmed parts before continuing.
+
+        An in-flight request with no confirmation is never automatically replayed.
+        Lightweight adapters without storage retain checkpoints for their lifetime;
+        production MessageBus uses SQLite and survives channel/process restarts.
+        """
+        bus = getattr(self, "bus", None)
+        durable = isinstance(bus, MessageBus) and bus.has_durable_outbound_storage
+        if require_durable and len(parts) > 1 and not durable:
+            return SendResult(success=False, error="durable outbound storage is unavailable")
+        prefix = f"{self.name}:{event.event_id}" + (f":{namespace}" if namespace else "")
+        if not fingerprint:
+            route = {key: event.metadata[key] for key in
+                     ("thread_ts", "conversation_type", "receive_id_type", "msg_type") if key in event.metadata}
+            fingerprint = hashlib.sha256(json.dumps(
+                [event.chat_id, event.reply_to_id, route, parts], ensure_ascii=False,
+                sort_keys=True,
+            ).encode()).hexdigest()
+        if not hasattr(self, "_volatile_parts"):
+            self._volatile_parts = {}
+            self._send_parts_lock = asyncio.Lock()
+        lock = bus.delivery_lock(f"{self.name}:{event.chat_id}") if isinstance(bus, MessageBus) else self._send_parts_lock
+        receipts = []
+        async with lock:
+            if durable and (event.is_final or len(parts) > 1 or force_checkpoint):
+                try:
+                    await bus._turn_run_store.register_outbound(event)
+                    bus.track_outbound(event.event_id)
+                except Exception as exc:
+                    return SendResult(success=False, error=str(exc))
+            first = await bus.get_outbound_part(f"{prefix}:0") if durable else self._volatile_parts.get(f"{prefix}:0")
+            checkpointed = force_checkpoint or len(parts) > 1 or first is not None or durable and event.is_final
+            for index, part in enumerate(parts):
+                part_id = f"{prefix}:{index}"
+                old = await bus.get_outbound_part(part_id) if durable else self._volatile_parts.get(part_id)
+                if old is not None:
+                    if old["fingerprint"] != fingerprint:
+                        return SendResult(success=False, error="outbound delivery identity conflict", message_ids=receipts)
+                    if old["message_id"]:
+                        receipts.append(old["message_id"])
+                        continue
+                    return SendResult(success=False, error="delivery unknown; automatic replay withheld",
+                                      message_ids=receipts, delivery_unknown=True)
+                request_started = False
+                try:
+                    # Waiting or refreshing credentials cannot leave an unsent reservation.
+                    if before_send is not None:
+                        await before_send(index, part)
+                    if checkpointed:
+                        if durable:
+                            claim = await bus.claim_outbound_part(part_id, fingerprint)
+                            if not claim["new"]:
+                                if claim["message_id"]:
+                                    receipts.append(claim["message_id"])
+                                    continue
+                                return SendResult(success=False, error="delivery unknown; automatic replay withheld",
+                                                  message_ids=receipts, delivery_unknown=True)
+                        else:
+                            if len(self._volatile_parts) >= 100_000:
+                                raise RuntimeError("outbound delivery ledger is full")
+                            self._volatile_parts[part_id] = {"fingerprint": fingerprint, "message_id": ""}
+                    request_started = True
+                    result = await sender(index, part)
+                    if not result.success:
+                        if checkpointed and not result.delivery_unknown:
+                            if durable:
+                                await bus.finish_outbound_part(part_id, None)
+                            else:
+                                self._volatile_parts.pop(part_id, None)
+                        elif checkpointed and durable:
+                            await bus._turn_run_store.mark_outbound_unknown(part_id)
+                        result.message_ids = list(receipts)
+                        return result
+                    receipt = result.message_id or f"ack:{part_id}"
+                    if checkpointed:
+                        if durable:
+                            await bus.finish_outbound_part(part_id, receipt)
+                        else:
+                            self._volatile_parts[part_id]["message_id"] = receipt
+                    receipts.append(receipt)
+                except DeliveryRejected as exc:
+                    if checkpointed:
+                        if durable:
+                            await bus.finish_outbound_part(part_id, None)
+                        else:
+                            self._volatile_parts.pop(part_id, None)
+                    return SendResult(success=False, error=self.safe_delivery_error(exc), message_ids=receipts)
+                except asyncio.CancelledError:
+                    if checkpointed and durable:
+                        if request_started:
+                            await asyncio.shield(bus._turn_run_store.mark_outbound_unknown(part_id))
+                        else:
+                            await asyncio.shield(bus.finish_outbound_part(part_id, None))
+                        await asyncio.shield(bus._turn_run_store.update_outbound(
+                            event.event_id, "unknown" if request_started else "failed", "send interrupted",
+                        ))
+                    raise
+                except Exception as exc:
+                    if checkpointed and durable and request_started:
+                        await bus._turn_run_store.mark_outbound_unknown(part_id)
+                    return SendResult(success=False, error=self.safe_delivery_error(exc), message_ids=receipts,
+                                      delivery_unknown=request_started)
+        return SendResult(success=True, message_id=receipts[0] if receipts else "", message_ids=receipts)
+
+    def safe_delivery_error(self, exc: Exception) -> str:
+        error = str(exc) or type(exc).__name__
+        for key in ("_token", "_bot_token", "_access_token", "_app_secret", "_app_key"):
+            secret = getattr(self, key, None)
+            if isinstance(secret, str) and len(secret) >= 4:
+                error = error.replace(secret, "[redacted]")
+        return error
 
     def should_deliver(self, event: OutboundEvent) -> bool:
         """Return False to silently skip non-final messages on channels that cannot edit.
@@ -146,6 +268,12 @@ class BaseChannel(ABC):
         if "*" in allow_list:
             return True
         return str(sender_id) in allow_list
+
+    async def is_clarification_reply(self, sender_id: str, chat_id: str) -> bool:
+        bus = getattr(self, "bus", None)
+        if bus is None or not self.is_allowed(sender_id):
+            return False
+        return await bus.has_clarification(self.name, str(chat_id), str(sender_id), is_group=True)
 
     def _build_event(
         self,

@@ -250,6 +250,7 @@ class AgentLoop:
         self.workspace = workspace
         # Optional program-owned policy is installed only after plugin activation.
         self._runtime_extension = None
+        self._runtime_failure = None
         # 阶段 B(start 内 _resolve_embed_and_index)需要 storage 才能定案 backend
         # 并构造 VectorIndex/依赖它的消费者,故在此固化引用。
         self._storage = storage
@@ -387,6 +388,7 @@ class AgentLoop:
         from echo_agent.agent.clarify_manager import ClarifyManager
 
         self.clarify = ClarifyManager()
+        self.bus.set_clarification_checker(self._has_im_clarification)
         from echo_agent.agent.interrupt_manager import InterruptManager
 
         self.interrupt = InterruptManager()
@@ -818,6 +820,7 @@ class AgentLoop:
         extension = manager.runtime_extension
         self._runtime_extension = extension if isinstance(extension, RuntimeExtension) else None
         self.config._runtime_extension = self._runtime_extension
+        self.tools.set_execution_guard(self._assert_runtime_healthy)
         self._inference_stage.set_hook_registry(manager.hooks)
         if self._native_tools_deferred:
             self._register_tools(self._scheduler, self._task_manager, self._workflow_engine)
@@ -1299,10 +1302,11 @@ class AgentLoop:
             )
 
     async def start(self) -> None:
-        if self._native_tools_deferred:
+        if getattr(self, "_native_tools_deferred", False):
             raise RuntimeError("required plugins must be activated before starting the agent")
-        if self._runtime_extension is not None:
+        if getattr(self, "_runtime_extension", None) is not None:
             await self._runtime_extension.recover()
+            self._runtime_failure = None
         # Rejections happen outside the normal inbound handler (session limiter,
         # shutdown deadline), so subscribe a dedicated lifecycle sink before the
         # bus can leave any already-accepted event without a terminal record.
@@ -1374,7 +1378,11 @@ class AgentLoop:
         # for its whole lifetime with no MCP tools and no error anyone sees.
         from echo_agent.agent.background import Tier
 
-        self._spawn_background(self._start_mcp_background(), tier=Tier.DURABLE)
+        if getattr(self, "_runtime_extension", None) is not None:
+            await self._start_mcp_background()
+            self._assert_runtime_healthy()
+        else:
+            self._spawn_background(self._start_mcp_background(), tier=Tier.DURABLE)
         self._start_spill_sweeper()
         self._start_artifact_sweeper()
         # Skill admission candidate store: ensure schema exists before the first
@@ -1620,7 +1628,20 @@ class AgentLoop:
         try:
             await self._start_mcp()
         except Exception as e:
+            from echo_agent.plugins.runtime import RuntimeExtensionError
+            if isinstance(e, RuntimeExtensionError):
+                self._runtime_failure = e
+                if self.mcp_manager is not None:
+                    await self.mcp_manager.stop_all()
+                raise
             logger.error("MCP initialization failed (agent continues without MCP tools): {}", e)
+
+    def _assert_runtime_healthy(self) -> None:
+        failure = getattr(self, "_runtime_failure", None)
+        if failure is not None:
+            raise failure
+        if getattr(self, "_runtime_extension", None) is not None and self.mcp_manager is not None:
+            self.mcp_manager.assert_extension_healthy()
 
     async def _start_mcp(self) -> None:
         # tools.mcp.enabled 是 setup 向导写入的总开关,而这里过去只读 mcp_servers,
@@ -1647,6 +1668,7 @@ class AgentLoop:
         )
         await self.mcp_manager.start_all(mcp_servers)
         await self.mcp_manager.discover_tools(self.tools)
+        self._assert_runtime_healthy()
         self._apply_runtime_tool_policy()
 
     def _apply_runtime_tool_policy(self) -> None:
@@ -1697,7 +1719,7 @@ class AgentLoop:
         except Exception as e:
             logger.debug("Cron outcome writeback failed for job {}: {}", job_id, e)
 
-    async def _record_task_outcome(self, event: InboundEvent, status: str, error: str = "") -> None:
+    async def _record_task_outcome(self, event: InboundEvent, status: str, error: str = "", *, response_text: str = "") -> None:
         """For a dispatched board task, drive it to a terminal state after its turn
         finishes — the safety net that keeps a task from being stuck at RUNNING if
         the agent didn't close it out via the task tool itself. `status` is one of
@@ -1725,7 +1747,7 @@ class AgentLoop:
             # drove the task terminal (the agent didn't call complete/fail).
             before = await manager.get(task_id)
             was_open = before is not None and before.status not in TERMINAL_TASK_STATUSES
-            after = await manager.mark_terminal(task_id, target, error=error)
+            after = await manager.mark_terminal(task_id, target, error=error, result=response_text)
         except Exception as e:
             logger.debug("Task outcome writeback failed for task {}: {}", task_id, e)
             return
@@ -1827,7 +1849,6 @@ class AgentLoop:
         # so the model sees WHAT is being answered — otherwise a bare "A" reads
         # as an isolated, ambiguous message. This runs on IM channels only; CLI
         # uses the blocking /clarify path and never registers an IM pending.
-        self._maybe_bind_im_clarify_answer(event)
         session_lock = await self.sessions.acquire(event.session_key)
         async with session_lock:
             trace_id = uuid.uuid4().hex[:12]
@@ -1847,6 +1868,10 @@ class AgentLoop:
                 await heartbeat.start(activity)
                 result = await self._process_event(event, trace_id, publish_response=True, activity=activity)
                 response_text = result.response_text
+                if result.termination_reason == "awaiting_clarification":
+                    session = await self.sessions.get_or_create(event.session_key)
+                    session.metadata["_latest_clarification_id"] = event.metadata.get("_clarification", {}).get("id", "")
+                    await self.sessions.save(session)
 
                 # Delivery point. Text convergence (degraded notices, English
                 # filler → Chinese fallback) already happened in
@@ -1864,8 +1889,15 @@ class AgentLoop:
                 # Default True so a turn with nothing to publish (e.g. silenced
                 # inspection, or an already-delivered stream) is not falsely faulted.
                 delivered = True
-                if final_text and _should_publish_reply(event, final_text):
+                delivery = getattr(result, "delivery_result", None)
+                if delivery is not None and delivery.detail.get("delivery_unknown"):
+                    # A timed-out final may already be visible remotely. Keep
+                    # its failure truthful and let the operator verify it.
+                    final_text = ""
+                    delivered = False
+                if final_text and event.channel != "task" and _should_publish_reply(event, final_text):
                     out = OutboundEvent.from_text_with_media(
+                        event_id=f"reply:{event.event_id}",
                         channel=event.channel,
                         chat_id=event.chat_id,
                         text=final_text,
@@ -1873,6 +1905,10 @@ class AgentLoop:
                     )
                     out.metadata = dict(event.metadata)
                     out.metadata["_inbound_event_id"] = event.event_id
+                    from dataclasses import replace
+                    out.delivery_origin = replace(event, metadata=dict(event.metadata))
+                    if result.termination_reason == "awaiting_clarification":
+                        out.message_kind = "clarification"
                     if getattr(result, "task_incomplete", False):
                         outcome = "interrupted" if result.termination_reason == "interrupted" else "incomplete"
                         stamp_turn_outcome(
@@ -1884,9 +1920,13 @@ class AgentLoop:
                         stamp_turn_outcome(out.metadata, "completed")
                     delivery = await self.bus.publish_outbound(out)
                     delivered = delivery.ok
-                    extension = getattr(self, "_runtime_extension", None)
-                    if extension is not None:
-                        await extension.record_delivery(event, delivery)
+                extension = getattr(self, "_runtime_extension", None)
+                if extension is not None and delivery is not None:
+                    await extension.record_delivery(event, delivery)
+                if (result.termination_reason == "awaiting_clarification" and
+                        (event.channel == "task" or delivery is not None and delivery.ok
+                         and not delivery.detail.get("skipped") and not delivery.detail.get("deferred"))):
+                    await self._commit_im_clarification(event)
                 self.tracer.end_span(span, metadata={"response_len": len(response_text or "")})
                 # A turn that returned without raising still may not have FINISHED
                 # the task: a failed delivery, or a provider error / budget /
@@ -1899,7 +1939,10 @@ class AgentLoop:
                     if result.termination_reason == "awaiting_clarification":
                         self.clarify.clear_im_pending(event.session_key)
                     await self._record_cron_outcome(event, "error", "delivery failed")
-                    await self._record_task_outcome(event, "error", "delivery failed")
+                    if result.termination_reason == "awaiting_clarification":
+                        await self._wait_task_for_clarification(event, response_text, delivery_failed=True)
+                    else:
+                        await self._record_task_outcome(event, "error", "delivery failed")
                     await self._mark_turn_terminal(
                         event.event_id,
                         "failed",
@@ -1908,7 +1951,10 @@ class AgentLoop:
                     )
                 elif getattr(result, "task_incomplete", False):
                     await self._record_cron_outcome(event, "completed")
-                    await self._record_task_outcome(event, "incomplete")
+                    if result.termination_reason == "awaiting_clarification":
+                        await self._wait_task_for_clarification(event, response_text)
+                    else:
+                        await self._record_task_outcome(event, "incomplete")
                     terminal = "interrupted" if result.termination_reason == "interrupted" else "incomplete"
                     await self._mark_turn_terminal(
                         event.event_id,
@@ -1918,7 +1964,8 @@ class AgentLoop:
                     )
                 else:
                     await self._record_cron_outcome(event, "completed")
-                    await self._record_task_outcome(event, "completed")
+                    task_result = {"response_text": response_text} if event.metadata.get("task_id") else {}
+                    await self._record_task_outcome(event, "completed", **task_result)
                     await self._mark_turn_terminal(
                         event.event_id,
                         "completed",
@@ -2020,9 +2067,7 @@ class AgentLoop:
             )
             if not claimed:
                 raise DuplicateTurnClaim(event.event_id)
-        if extension is not None and self.mcp_manager is not None:
-            # Native confirmations and attachments also precede model inference.
-            self.mcp_manager.assert_extension_healthy()
+        self._assert_runtime_healthy()
         command_response = await extension.handle_event(event) if extension is not None else None
         if command_response is None:
             command_response = await self._handle_approval_command(event)
@@ -2034,7 +2079,24 @@ class AgentLoop:
 
         if extension is not None:
             await extension.before_turn(self.mcp_manager)
+            self._assert_runtime_healthy()
             self._apply_runtime_tool_policy()
+
+        # Hooks may refuse a turn. Consume an answer only after those checks, so
+        # a transient runtime failure does not discard the question or its task.
+        if event.event_type == EventType.MESSAGE and not event.unattended and not event.is_control:
+            had_persisted_question = "_im_clarification" in session.metadata
+            self._restore_im_clarification(session)
+            self._maybe_bind_im_clarify_answer(event)
+            if had_persisted_question and (event.clarification_answer or event.session_key not in self.clarify._im_pending):
+                session.metadata.pop("_im_clarification", None)
+                await self.sessions.save(session)
+            if event.clarification_answer and not await self._resume_clarification_task(event):
+                return _ProcessResult(response_text="该任务已结束，不能继续执行。请重新发起任务。")
+        elif event.clarification_answer and event.channel == "task":
+            session.metadata.pop("_im_clarification", None)
+            self.clarify.clear_im_pending(event.session_key)
+            await self.sessions.save(session)
 
         recorder = self.evolution.recorder if self.evolution is not None else None
         if recorder is not None and not _is_ephemeral_session(event.session_key, event.channel):
@@ -2082,7 +2144,7 @@ class AgentLoop:
                 ctx.activity = activity
             # Stage 2: Inference (LLM + tool execution loop)
             inference_result = await self._inference_stage.run(ctx)
-            if extension is not None:
+            if extension is not None and inference_result.termination_reason != "awaiting_clarification":
                 presentation = await extension.presentation(event)
                 if presentation is not None:
                     inference_result.response_text = presentation
@@ -2121,6 +2183,7 @@ class AgentLoop:
             task_incomplete=result.task_incomplete,
             output_truncated=result.output_truncated,
             termination_reason=result.termination_reason,
+            delivery_result=getattr(result, "delivery_result", None),
         )
 
     async def _handle_approval_command(self, event: InboundEvent) -> str | None:
@@ -2240,11 +2303,14 @@ class AgentLoop:
         # 用户显式引用了某条消息:引用意图优先于隐式追问绑定,不再改写 reply_to_text。
         # 但仍要清理本 session 的待答状态,否则旧问题会残留 —— 引用回答成功后,下一条
         # 无关消息会被误绑到已被回答过的旧问题上。
-        if event.reply_to_text:
+        ttl = float(self.config.session.im_clarify_pending_ttl_seconds)
+        pending = clarify.peek_im_pending(session_key, ttl, event.sender_id)
+        if pending is None:
+            return
+        if event.reply_to_text and (not event.reply_to_is_own or pending.question not in event.reply_to_text):
             clarify.clear_im_pending(session_key)
             return
-        ttl = float(self.config.session.im_clarify_pending_ttl_seconds)
-        req = clarify.take_im_pending(session_key, ttl)
+        req = clarify.take_im_pending(session_key, ttl, event.sender_id)
         if req is None:
             return
         question = (req.question or "").strip()
@@ -2256,6 +2322,132 @@ class AgentLoop:
         event.reply_to_text = quoted
         event.reply_to_is_own = True
         event.reply_to_sender = None
+        event.clarification_answer = True
+        event.metadata.update(req.continuation)
+
+    def _restore_im_clarification(self, session: Any) -> None:
+        if session.key in self.clarify._im_pending:
+            return
+        state = session.metadata.get("_im_clarification")
+        if not isinstance(state, dict):
+            return
+        expires = state.get("expires_at", 0)
+        if expires and (not isinstance(expires, (int, float)) or expires <= time.time()):
+            session.metadata.pop("_im_clarification", None)
+            return
+        if not isinstance(state.get("question"), str) or not isinstance(state.get("options", []), list):
+            session.metadata.pop("_im_clarification", None)
+            return
+        req = self.clarify.register_im_pending(
+            session.key, state["question"], state.get("options", []), state.get("user_id", ""),
+            continuation=state.get("continuation", {}),
+        )
+        if expires:
+            ttl = float(self.config.session.im_clarify_pending_ttl_seconds)
+            req.created_at -= max(0, ttl - (expires - time.time()))
+
+    async def _commit_im_clarification(self, event: InboundEvent) -> None:
+        req = self.clarify._im_pending.get(event.session_key)
+        if req is None:
+            return
+        ttl = float(self.config.session.im_clarify_pending_ttl_seconds)
+        session = await self.sessions.get_or_create(event.session_key)
+        session.metadata["_im_clarification"] = {
+            "id": event.metadata.get("_clarification", {}).get("id", req.id),
+            "question": req.question, "options": req.options, "user_id": req.user_id,
+            "continuation": req.continuation, "expires_at": time.time() + ttl if ttl > 0 else 0,
+        }
+        await self.sessions.save(session)
+        self.clarify.confirm_im_delivery(event.session_key)
+
+    async def _has_im_clarification(self, channel: str, chat_id: str, sender_id: str,
+                                    *, is_group: bool = False) -> bool:
+        event = InboundEvent(channel=channel, chat_id=chat_id, sender_id=sender_id, is_group=is_group)
+        extension = getattr(self, "_runtime_extension", None)
+        scope = (extension.session_scope if extension else None) or self.config.session.group_session_scope
+        key = event.scoped_session_key(scope)
+        session = await self.sessions.get(key)
+        if session is not None:
+            self._restore_im_clarification(session)
+        return self.clarify.peek_im_pending(
+            key, float(self.config.session.im_clarify_pending_ttl_seconds), sender_id,
+            include_staged=True,
+        ) is not None
+
+    async def can_recover_clarification(self, outbound: OutboundEvent) -> bool:
+        state = outbound.metadata.get("_clarification", {})
+        session = await self.sessions.get(state.get("session_key", ""))
+        latest = session.metadata.get("_latest_clarification_id") if session else None
+        if latest and latest != state.get("id"):
+            return False
+        task_id = state.get("continuation", {}).get("task_id")
+        manager = getattr(self, "_task_manager", None)
+        if task_id and manager is not None:
+            from echo_agent.tasks.models import TaskStatus
+            task = await manager.get(task_id)
+            return task is not None and task.status == TaskStatus.BLOCKED and bool(task.metadata.get("_awaiting_clarification"))
+        return True
+
+    async def restore_delivered_clarification(self, outbound: OutboundEvent, *, already_locked: bool = False) -> None:
+        state = outbound.metadata.get("_clarification")
+        if outbound.message_kind != "clarification" or not isinstance(state, dict):
+            return
+        event = InboundEvent(channel=outbound.channel, chat_id=outbound.chat_id,
+                             sender_id=state["user_id"], session_key_override=state["session_key"],
+                             metadata=dict(state.get("continuation", {})))
+        if not already_locked:
+            lock = await self.sessions.acquire(event.session_key)
+            async with lock:
+                return await self.restore_delivered_clarification(outbound, already_locked=True)
+        event.metadata["_clarification"] = state
+        self.clarify.register_im_pending(event.session_key, state["question"], state.get("options", []),
+                                         event.sender_id, delivered=False,
+                                         continuation=state.get("continuation", {}))
+        await self._commit_im_clarification(event)
+        await self._wait_task_for_clarification(event, state["question"])
+
+    async def record_recovered_delivery(self, outbound: OutboundEvent, result: Any) -> None:
+        extension = getattr(self, "_runtime_extension", None)
+        if extension is not None and outbound.delivery_origin is not None:
+            await extension.record_delivery(outbound.delivery_origin, result)
+
+    async def _wait_task_for_clarification(self, event: InboundEvent, question: str,
+                                          *, delivery_failed: bool = False) -> None:
+        manager = getattr(self, "_task_manager", None)
+        task_id = event.metadata.get("task_id")
+        if manager is None or not task_id:
+            return
+        from echo_agent.tasks.models import TaskStatus
+        task = await manager.get(task_id)
+        if task is not None and (task.status == TaskStatus.RUNNING or
+                                 task.status == TaskStatus.BLOCKED and task.metadata.get("_awaiting_clarification")):
+            reason = f"提问暂未送达，等待投递恢复。\n{question}" if delivery_failed else question
+            metadata = {**task.metadata, "_awaiting_clarification": True}
+            if event.channel == "task" and isinstance(event.metadata.get("_clarification"), dict):
+                metadata["_clarification"] = event.metadata["_clarification"]
+                metadata.pop("_clarification_response", None)
+            await manager.update(task_id, blocked_reason=reason, error="",
+                                 metadata=metadata)
+            if task.status == TaskStatus.RUNNING:
+                await manager.transition(task_id, TaskStatus.BLOCKED)
+
+    async def _resume_clarification_task(self, event: InboundEvent) -> bool:
+        manager = getattr(self, "_task_manager", None)
+        task_id = event.metadata.get("task_id")
+        if manager is None or not task_id:
+            return True
+        from echo_agent.tasks.models import TaskStatus, TERMINAL_TASK_STATUSES
+        task = await manager.get(task_id)
+        if task is None or task.status in TERMINAL_TASK_STATUSES:
+            return False
+        if task.status == TaskStatus.BLOCKED and task.metadata.get("_awaiting_clarification"):
+            metadata = dict(task.metadata)
+            metadata.pop("_awaiting_clarification", None)
+            await manager.update(task_id, blocked_reason="", metadata=metadata,
+                                 owner_id="", lease_until_ms=0, attempt_id="")
+            await manager.transition(task_id, TaskStatus.RUNNING)
+            await manager.set_running_context(task_id, event.session_key, event.event_id)
+        return True
 
     _CLARIFY_CANCEL_CMD = "/__clarify_cancel__"
 

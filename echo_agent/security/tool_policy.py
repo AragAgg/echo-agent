@@ -146,11 +146,10 @@ def tool_policy_decision(config: "Config", tool: object) -> tuple[bool, str]:
     extension = config._runtime_extension
     patterns = extension.allowed_tool_patterns if extension is not None else None
     if patterns is not None:
-        if any(fnmatchcase(name, pattern) for pattern in patterns):
-            return True, "allowed by installed runtime extension"
-        return False, "outside installed runtime extension policy"
-
-    if tools_cfg.allow:
+        if not any(fnmatchcase(name, pattern) for pattern in patterns):
+            return False, "outside installed runtime extension policy"
+        base_allowed = True
+    elif tools_cfg.allow:
         base_allowed = name in tools_cfg.allow
     else:
         base_allowed = _profile_allows(profile, name) or name in tools_cfg.also_allow

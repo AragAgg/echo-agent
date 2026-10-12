@@ -266,6 +266,25 @@ class TasksAPI:
                 pass
         return web.json_response({"task": task.to_dict()})
 
+    async def answer_clarification(self, request: web.Request) -> web.Response:
+        guard = self._write_guard(request, "tasks_answer_clarification")
+        if guard is not None:
+            return guard
+        try:
+            body = await request.json()
+        except (ValueError, TypeError):
+            return web.json_response({"error": "invalid JSON body"}, status=400)
+        if (not isinstance(body, dict) or not isinstance(body.get("answer"), str)
+                or not body["answer"].strip() or len(body["answer"]) > 10000
+                or not isinstance(body.get("question_id"), str) or not body["question_id"]):
+            return web.json_response({"error": "question_id and a nonempty answer (up to 10000 characters) are required"}, status=400)
+        try:
+            task = await self._manager().answer_clarification(
+                request.match_info["id"], body["question_id"], body["answer"].strip())
+        except ValueError as exc:
+            return web.json_response({"error": str(exc)}, status=409)
+        return web.json_response({"task": task.to_dict()})
+
     async def retry_task(self, request: web.Request) -> web.Response:
         """Retry a failed task. Distinct from a generic failed→queued transition:
         it goes through manager.retry, which increments retry_count and enforces

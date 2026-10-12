@@ -760,7 +760,8 @@ class ContextStage:
             session.metadata.get("_artifact_continuation")
             if isinstance(session.metadata, dict) else None
         )
-        resume_artifact = wants_artifact_resume(event.text) and artifact_continuation_is_live(
+        is_clarification_answer = getattr(event, "clarification_answer", False) is True
+        resume_artifact = (is_clarification_answer or wants_artifact_resume(event.text)) and artifact_continuation_is_live(
             artifact_resume_state, context_key=context_key,
         )
         if isinstance(artifact_resume_state, dict) and not resume_artifact:
@@ -775,6 +776,9 @@ class ContextStage:
             artifact_resume_state,
             context_key=context_key,
         )
+        if is_clarification_answer and resume_artifact:
+            artifact_required = {"artifact_create", "artifact_append", "artifact_validate",
+                                 "artifact_finalize", "artifact_deliver"}.issubset(available_names)
         artifact_intent_id = ""
         if artifact_required:
             artifact_intent_id = str(event.event_id or "")
@@ -834,7 +838,7 @@ class ContextStage:
             # the stored run instead of planning from scratch. Previously
             # get_resumable() had no production caller — interrupted plans were
             # persisted but every next message re-planned.
-            if self._plan_run_store is not None and wants_resume(event.text):
+            if self._plan_run_store is not None and (is_clarification_answer or wants_resume(event.text)):
                 try:
                     resumable = await self._plan_run_store.get_resumable(
                         context_key

@@ -168,6 +168,21 @@ class TaskDispatcher:
                 unattended=True,
                 metadata={"task_id": task.id},
             )
+            response = getattr(task, "metadata", {}).get("_clarification_response")
+            question = response.get("question") if isinstance(response, dict) else None
+            if (isinstance(response, dict) and isinstance(response.get("answer"), str)
+                    and isinstance(question, dict) and isinstance(question.get("question"), str)
+                    and isinstance(question.get("id"), str)):
+                from echo_agent.agent.tools.clarify import ClarifyTool
+                event.event_type = EventType.MESSAGE
+                event.sender_id = "operator"
+                event.content = [ContentBlock(type=ContentType.TEXT, text=response["answer"])]
+                event.reply_to_text = ClarifyTool._render_text(question["question"], question.get("options", []))
+                event.reply_to_is_own = True
+                event.clarification_answer = True
+                event.session_key_override = getattr(task, "session_id", "") or session_key
+                event.metadata["_clarification_id"] = question["id"]
+                session_key = event.session_key
             fut: asyncio.Future[None] = asyncio.get_running_loop().create_future()
             self._pending_release[task.id] = fut
             interrupt_admitted = False

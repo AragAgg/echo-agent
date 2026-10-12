@@ -132,7 +132,9 @@ async def test_auto_probe_failure_falls_back_to_fastembed(agent_loop_factory):
 
 
 @pytest.mark.asyncio
-async def test_local_backend_skips_probe(agent_loop_factory):
+async def test_local_backend_skips_probe(agent_loop_factory, monkeypatch):
+    from echo_agent.memory.local_embed import LocalEmbedder
+    monkeypatch.setattr(LocalEmbedder, "available", property(lambda self: True))
     loop = agent_loop_factory(embedding_backend="local", provider_embeds=[0.1])
     probe = loop._probe_spy  # factory 注入的探针调用记录
     await loop.start()

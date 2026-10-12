@@ -107,6 +107,12 @@ Re-queues a `FAILED` task, incrementing `retry_count` by 1.
 
 ### Blocked and Suspended
 
+A task asking for clarification becomes `BLOCKED`, preserving its session and plan without advancing the workflow. Open the task details on the board, select an option or enter an answer, then choose **Submit and continue**. The same task is queued to resume. Failed submissions keep the input. Duplicate answers, superseded questions and cancelled tasks cannot restart execution. Answering requires administrator access and grants no dangerous-tool permissions.
+
+Tasks linked to an IM conversation continue in that chat. If a question was not delivered, recover it through **Channels → Delivery recovery** first. Background board tasks store their final response in **Result**, without requiring a chat transport.
+
+The endpoint is `POST /api/v1/tasks/{id}/clarification` with `question_id` and a nonempty `answer` of up to 10,000 characters, under the configured gateway prefix.
+
 - **BLOCKED**: Task cannot proceed due to an external dependency. Set `blocked_reason` to explain why.
 - **SUSPENDED**: Manually paused. Can be resumed to `QUEUED` or `RUNNING` at any time.
 

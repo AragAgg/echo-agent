@@ -54,6 +54,8 @@ async def transport(monkeypatch, tmp_path):
         reply = replies[action]
         if isinstance(reply, list):
             status, reply = reply.pop(0)
+            if isinstance(reply, str):
+                return web.Response(text=reply, status=status)
             return web.json_response(reply, status=status)
         if isinstance(reply, str):
             return web.Response(text=reply, status=statuses[action])
@@ -128,6 +130,33 @@ async def test_partial_rejection_resumes_unsent_parts_after_channel_restart(tran
 
 
 @pytest.mark.asyncio
+async def test_real_loop_stream_fallback_never_repeats_confirmed_segments(transport, tmp_path):
+    from echo_agent.agent.loop import AgentLoop
+    from echo_agent.bus.events import InboundEvent
+    from echo_agent.config.schema import Config
+    from tests.plugins.test_runtime_extension_reliability import ReplyProvider
+    from echo_agent.models.provider import LLMResponse
+    from tests.test_outbound_final_dedup import _manager
+    channel, bus, calls, replies, _ = transport
+    channel._running = True
+    _manager(bus, channel)
+    class LongReply(ReplyProvider):
+        async def chat(self, *args, **kwargs):
+            return LLMResponse(content="A" * 32054, finish_reason="stop")
+    config = Config(workspace=str(tmp_path), memory={"enabled": False},
+                    channels={"stream_channels": ["dingtalk"]}, observability={"otel_enabled": False})
+    loop = AgentLoop(bus=bus, config=config, provider=LongReply(), workspace=tmp_path)
+    loop._running = True
+    replies["send"] = [(200, {"processQueryKey": "first"}), (429, {"code": "Throttling"}),
+                       (200, {"processQueryKey": "second"}), (200, {"processQueryKey": "third"})]
+    await loop._on_inbound(InboundEvent.text_message("dingtalk", "staff", "staff123", "长回复", event_id="native-long"))
+    sends = [json.loads(call["payload"]["msgParam"])["content"] for call in calls if "payload" in call]
+    assert len(sends) == 4 and sends[0] not in sends[2:] and sends[1] == sends[2]
+    parts = await bus._turn_run_store.outbound_parts("reply:native-long", "dingtalk")
+    assert len(parts) == 3 and all(part["message_id"] for part in parts)
+
+
+@pytest.mark.asyncio
 async def test_ambiguous_partial_send_does_not_replay_or_claim_delivery(transport):
     channel, _, calls, replies, _ = transport
     event = OutboundEvent.text_reply(channel="dingtalk", chat_id="staff123", text="A" * 32054)
@@ -170,6 +199,72 @@ async def test_timeout_keeps_unknown_checkpoint(transport, monkeypatch):
     count = len(calls)
     assert "unknown" in (await channel.send(event)).error
     assert attempts == 2 and len(calls) == count
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("response", ["Too Many Requests", {"errcode": 88, "errmsg": "rate limited"}])
+async def test_definite_rejection_without_standard_error_json_can_resume(transport, response):
+    channel, bus, calls, replies, _ = transport
+    event = OutboundEvent.text_reply("dingtalk", "staff123", "A" * 32054)
+    replies["send"] = [(200, {"processQueryKey": "first"}), (429 if isinstance(response, str) else 200, response)]
+    assert not (await bus.publish_outbound(event)).ok
+    replies["send"] = [(200, {"processQueryKey": "second"}), (200, {"processQueryKey": "third"})]
+    recovered = await bus.publish_outbound(event)
+    assert recovered.ok and recovered.detail["message_ids"] == ["first", "second", "third"]
+    assert len([call for call in calls if "payload" in call]) == 4
+
+
+@pytest.mark.asyncio
+async def test_cancelling_throttle_does_not_reserve_an_unsent_part(transport, monkeypatch):
+    channel, bus, calls, _, _ = transport
+    monkeypatch.setattr(dingtalk, "_TEXT_SEND_INTERVAL", 60)
+    event = OutboundEvent.text_reply("dingtalk", "staff123", "A" * 32054)
+    sending = asyncio.create_task(channel.send(event))
+    for _ in range(100):
+        part = await bus.get_outbound_part(f"dingtalk:{event.event_id}:0")
+        if part and part["message_id"]:
+            break
+        await asyncio.sleep(0.01)
+    else:
+        pytest.fail("first part was not acknowledged")
+    assert await bus.get_outbound_part(f"dingtalk:{event.event_id}:1") is None
+    sending.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await sending
+    monkeypatch.setattr(dingtalk, "_TEXT_SEND_INTERVAL", 0)
+    assert (await bus.publish_outbound(event)).ok
+    assert len([call for call in calls if "payload" in call]) == 3
+
+
+@pytest.mark.asyncio
+async def test_file_rendering_request_is_not_silently_changed_to_image(transport, tmp_path):
+    channel, bus, calls, _, _ = transport
+    path = tmp_path / "cover.png"
+    path.write_bytes(b"image data")
+    tool = SendFileTool(str(tmp_path), publish_fn=bus.publish_outbound, channel_lookup=lambda name: channel)
+    result = await tool.execute({"channel": "dingtalk", "chat_id": "staff1", "file_path": str(path), "as_image": False})
+    assert not result.success and "ZIP" in result.error
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_attachment_retry_skips_confirmed_caption_and_files(transport, tmp_path):
+    channel, bus, calls, replies, _ = transport
+    paths = [tmp_path / "one.pdf", tmp_path / "two.pdf"]
+    for path in paths:
+        path.write_bytes(b"document")
+    event = OutboundEvent(channel="dingtalk", chat_id="staff1", content=[
+        ContentBlock(text="Reports"), *[ContentBlock(type=ContentType.FILE, url=str(path)) for path in paths],
+    ])
+    replies["send"] = [(200, {"processQueryKey": "caption"}), (200, {"processQueryKey": "one"}),
+                       (429, {"code": "Throttling"})]
+    assert not (await bus.publish_outbound(event)).ok
+    replies["send"] = [(200, {"processQueryKey": "two"})]
+    assert (await bus.publish_outbound(event)).ok
+    uploads = [call["filename"] for call in calls if call["path"] == "/media/upload"]
+    assert uploads == ["one.pdf", "two.pdf", "two.pdf"]
+    texts = [call for call in calls if call.get("payload", {}).get("msgKey") == "sampleText"]
+    assert len(texts) == 1
 
 
 @pytest.mark.asyncio

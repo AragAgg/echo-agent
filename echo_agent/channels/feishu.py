@@ -14,6 +14,7 @@ from loguru import logger
 from echo_agent.bus.events import OutboundEvent
 from echo_agent.bus.queue import MessageBus
 from echo_agent.channels.base import BaseChannel, SendResult
+from echo_agent.utils.text import split_encoded_message
 from echo_agent.config.schema import FeishuChannelConfig
 
 _API_BASE = "https://open.feishu.cn/open-apis"
@@ -87,28 +88,31 @@ class FeishuChannel(BaseChannel):
         chat_id = event.chat_id
         receive_id_type = event.metadata.get("receive_id_type", "chat_id")
         url = f"{_API_BASE}/im/v1/messages?receive_id_type={receive_id_type}"
-        payload = {
-            "receive_id": chat_id,
-            "msg_type": "text",
-            "content": json.dumps({"text": text}),
-        }
-        if event.reply_to_id:
-            url = f"{_API_BASE}/im/v1/messages/{event.reply_to_id}/reply"
-            payload = {
-                "msg_type": "text",
-                "content": json.dumps({"text": text}),
-            }
-        headers = {"Authorization": f"Bearer {self._tenant_token}"}
-        try:
-            async with self._session.post(url, json=payload, headers=headers) as resp:
-                data = await resp.json()
-                if data.get("code", 0) != 0:
-                    logger.warning("Feishu send error: {} {}", data.get("code"), data.get("msg"))
-                    return SendResult(success=False, error=f"{data.get('code')}: {data.get('msg')}")
-        except Exception as e:
-            logger.error("Feishu send error: {}", e)
-            return SendResult(success=False, error=str(e))
-        return SendResult(success=True)
+        def encoded_size(part):
+            return len(json.dumps(json.dumps({"text": part}, ensure_ascii=False)).encode())
+
+        async def send_part(index, part):
+            part_url = url
+            payload = {"receive_id": chat_id, "msg_type": "text",
+                       "content": json.dumps({"text": part}, ensure_ascii=False)}
+            if event.reply_to_id:
+                part_url = f"{_API_BASE}/im/v1/messages/{event.reply_to_id}/reply"
+                payload.pop("receive_id")
+            headers = {"Authorization": f"Bearer {self._tenant_token}"}
+            try:
+                async with self._session.post(part_url, json=payload, headers=headers) as resp:
+                    data = await resp.json()
+                    if resp.status >= 400 or data.get("code", 0) != 0:
+                        return SendResult(success=False, error=f"{data.get('code')}: {data.get('msg')}",
+                                          delivery_unknown=resp.status >= 500)
+                    message_id = str((data.get("data") or {}).get("message_id") or "")
+                    if not message_id:
+                        return SendResult(success=False, error="Feishu send receipt missing", delivery_unknown=True)
+                    return SendResult(success=True, message_id=message_id)
+            except Exception as exc:
+                return SendResult(success=False, error=type(exc).__name__, delivery_unknown=True)
+        # A conservative budget includes both JSON layers, including Unicode escaping.
+        return await self.send_parts(event, split_encoded_message(text, 8000, encoded_size), send_part)
 
     # ── Webhook ──────────────────────────────────────────────────────────────
 
@@ -173,7 +177,7 @@ class FeishuChannel(BaseChannel):
                 m.get("id", {}).get("open_id") == self._bot_open_id
                 for m in mentions
             )
-            if not bot_mentioned:
+            if not bot_mentioned and not await self.is_clarification_reply(sender_id, chat_id):
                 return
 
         text = ""

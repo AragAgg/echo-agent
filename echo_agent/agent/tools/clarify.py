@@ -87,6 +87,12 @@ class ClarifyTool(Tool):
     def __init__(self, manager: ClarifyManager):
         self._manager = manager
 
+    def validate_params(self, params: dict[str, Any]) -> list[str]:
+        errors = super().validate_params(params)
+        if isinstance(params.get("question"), str) and not params["question"].strip():
+            errors.append("question must not be blank")
+        return errors
+
     @staticmethod
     def _render_text(question: str, options: list[str]) -> str:
         if not options:
@@ -98,10 +104,10 @@ class ClarifyTool(Tool):
         lines: list[str] = []
         for i, opt in enumerate(options):
             label = f"{chr(65 + i)}. "
-            # Models use "A 七猫", "A. 七猫" or Chinese separators. Remove only
+            # Models use "A. 七猫" or Chinese separators. Remove only
             # this option's explicit label, preserving content such as "AI 分析".
             text = re.sub(
-                rf"^\s*{re.escape(chr(65 + i))}(?:[.．、:：)）]\s*|\s+)",
+                rf"^\s*{re.escape(chr(65 + i))}[.．、:：)）]\s*",
                 "", str(opt), count=1, flags=re.IGNORECASE,
             )
             lines.append(f"  {label}{text}")

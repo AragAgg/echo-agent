@@ -58,6 +58,8 @@ class DeliveryResult:
                 detail["deferred"] = True
             return cls(DeliveryStage.DELIVERED, channel, detail=detail)
         detail = {"deferred": True} if sr.deferred else {}
+        if sr.delivery_unknown:
+            detail["delivery_unknown"] = True
         if sr.message_ids:
             detail["message_ids"] = list(sr.message_ids)
         return cls(

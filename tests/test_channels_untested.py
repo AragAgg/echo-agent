@@ -349,7 +349,8 @@ class TestFeishuChannel:
         ch._token_expires = time.time() + 9999
 
         mock_resp = AsyncMock()
-        mock_resp.json = AsyncMock(return_value={"code": 0})
+        mock_resp.json = AsyncMock(return_value={"code": 0, "data": {"message_id": "fixture-message"}})
+        mock_resp.status = 200
         mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
         mock_resp.__aexit__ = AsyncMock(return_value=False)
         ch._session.post = MagicMock(return_value=mock_resp)
@@ -370,7 +371,8 @@ class TestFeishuChannel:
         ch._token_expires = time.time() + 9999
 
         mock_resp = AsyncMock()
-        mock_resp.json = AsyncMock(return_value={"code": 0})
+        mock_resp.json = AsyncMock(return_value={"code": 0, "data": {"message_id": "fixture-reply"}})
+        mock_resp.status = 200
         mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
         mock_resp.__aexit__ = AsyncMock(return_value=False)
         ch._session.post = MagicMock(return_value=mock_resp)
@@ -616,6 +618,7 @@ class TestWeComChannel:
 
         mock_resp = AsyncMock()
         mock_resp.json = AsyncMock(return_value={"errcode": 0, "errmsg": "ok"})
+        mock_resp.status = 200
         mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
         mock_resp.__aexit__ = AsyncMock(return_value=False)
         ch._session.post = MagicMock(return_value=mock_resp)
@@ -635,6 +638,7 @@ class TestWeComChannel:
 
         mock_resp = AsyncMock()
         mock_resp.json = AsyncMock(return_value={"errcode": 40001, "errmsg": "invalid token"})
+        mock_resp.status = 200
         mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
         mock_resp.__aexit__ = AsyncMock(return_value=False)
         ch._session.post = MagicMock(return_value=mock_resp)

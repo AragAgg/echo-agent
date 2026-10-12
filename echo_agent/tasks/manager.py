@@ -132,6 +132,28 @@ class TaskManager:
             task.version = expected_version  # roll back optimistic bump before retry
         return ok
 
+    async def answer_clarification(self, task_id: str, question_id: str, answer: str) -> TaskRecord:
+        """Atomically queue a board answer; duplicate/stale answers cannot start work."""
+        for _ in range(3):
+            task = await self.get(task_id)
+            if task is None:
+                raise ValueError("task not found")
+            state = task.metadata.get("_clarification", {})
+            if (task.status != TaskStatus.BLOCKED or not task.metadata.get("_awaiting_clarification")
+                    or not isinstance(state, dict) or state.get("channel") != "task"
+                    or state.get("id") != question_id):
+                raise ValueError("this question is no longer awaiting an answer")
+            expected_version = task.version
+            task.metadata = {**task.metadata, "_clarification_response": {"answer": answer, "question": state}}
+            task.metadata.pop("_awaiting_clarification", None)
+            task.status = TaskStatus.QUEUED
+            task.blocked_reason = ""
+            task.updated_at = _now()
+            if await self._cas_persist(task, expected_version):
+                await self._emit("task_transitioned", task)
+                return task
+        raise TaskCASConflict(f"Task '{task_id}' answer lost CAS after retries")
+
     async def retry(self, task_id: str) -> TaskRecord:
         task = await self.get(task_id)
         if not task:

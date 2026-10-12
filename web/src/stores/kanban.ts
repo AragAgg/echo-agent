@@ -22,6 +22,7 @@ export interface TaskCard {
   max_retries: number;
   created_at: string;
   updated_at: string;
+  metadata?: Record<string, unknown>;
 }
 
 // 状态元数据:名称 + 配色 + 一句说明。覆盖后端全部 9 个状态(models.py TaskStatus)。
