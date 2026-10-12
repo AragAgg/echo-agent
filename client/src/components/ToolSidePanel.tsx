@@ -11,7 +11,8 @@
  * 兼容性：保留原导出名 `ToolSidePanel` / `ToolSidePanelMode` 与 ChatView 的 props，
  * 新增内部状态管理视图/标签/宽度。原 "tool" 模式仍用于展示单个工具调用详情。
  */
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { SidebarLayoutContext } from "@/lib/sidebar-layout";
 import type { ToolCallView } from "@/stores/session-store";
 import type { SessionArtifact } from "@/lib/session-artifacts";
 import type { FileChange } from "@/lib/file-changes";
@@ -24,6 +25,7 @@ import {
 import { ToolCallDetailBody } from "./ToolCallCard";
 import { openLocalPath } from "@/lib/markdown-host";
 import { FilePreview as RichFilePreview } from "./FilePreview";
+import { copyShareText } from "@/lib/share";
 import { detectPreviewKind, type PreviewKind } from "@/lib/file-kind";
 import {
   authorizeArtifactFile,
@@ -174,8 +176,9 @@ export function ToolSidePanel({
   });
 
   // ---- 面板布局状态 ----
+  const shellLayout = useContext(SidebarLayoutContext);
   const [viewportWidth, setViewportWidth] = useState(getViewportWidth);
-  const panelMaxWidth = getPanelMaxWidth(viewportWidth);
+  const panelMaxWidth = Math.min(getPanelMaxWidth(viewportWidth), shellLayout?.panelMaxWidth ?? Infinity);
   const [width, setWidth] = useState<number>(() => {
     return readStoredDimension(
       WIDTH_KEY,
@@ -195,6 +198,13 @@ export function ToolSidePanel({
   const [maximized, setMaximized] = useState(false);
   const [pinned, setPinned] = useState(false);
   const [navCollapsed, setNavCollapsed] = useState(false);
+  const closeRef = useRef(onClose);
+  closeRef.current = onClose;
+  const registerPanel = shellLayout?.registerPanel;
+  useLayoutEffect(() => {
+    registerPanel?.(open && !maximized ? { minimumWidth: MIN_WIDTH, close: () => closeRef.current() } : null);
+    return () => registerPanel?.(null);
+  }, [open, maximized, registerPanel]);
 
   const renderedPanelWidth = clamp(width, MIN_WIDTH, panelMaxWidth);
   const availablePanelWidth = maximized ? viewportWidth : renderedPanelWidth;
@@ -219,12 +229,14 @@ export function ToolSidePanel({
   }, []);
 
   useEffect(() => {
-    setWidth((current) => clamp(current, MIN_WIDTH, panelMaxWidth));
-  }, [panelMaxWidth]);
+    // Shell constraints are temporary; closing / resizing the left sidebar
+    // should restore the workspace panel's preferred width automatically.
+    if (!shellLayout) setWidth((current) => clamp(current, MIN_WIDTH, panelMaxWidth));
+  }, [panelMaxWidth, shellLayout]);
 
   useEffect(() => {
-    setNavWidth((current) => clamp(current, MIN_NAV_WIDTH, navMaxWidth));
-  }, [navMaxWidth]);
+    if (!shellLayout) setNavWidth((current) => clamp(current, MIN_NAV_WIDTH, navMaxWidth));
+  }, [navMaxWidth, shellLayout]);
 
   // 持久化经过校验的宽度；同时兼容无痕模式等 localStorage 不可写场景。
   useEffect(() => {
@@ -422,9 +434,11 @@ export function ToolSidePanel({
               browserUrl={browserUrl}
               onArtifactSelect={(a) => {
                 const tc = findToolCall?.(a.toolCallId);
-                if (tc) onSelectTool(tc);
-                onSelectArtifact(a);
-                handleArtifactSelect(a.id);
+                if (tc) {
+                  onSelectTool(tc);
+                } else {
+                  onToast?.("关联工具记录已不可用，可继续预览文件内容");
+                }
               }}
               onBrowserUrlChange={setBrowserUrl}
               onOpenOs={(path) => openLocalPath(path, {
@@ -780,14 +794,10 @@ function ArtifactFilePreview({
           filename={basename(path)}
           content={state.content}
           onCopyText={(content) => {
-            if (!navigator.clipboard?.writeText) {
-              onToast?.("当前环境不支持复制到剪贴板");
-              return;
-            }
-            void navigator.clipboard.writeText(content).then(
-              () => onToast?.("已复制文件内容"),
-              () => onToast?.("复制失败，请检查剪贴板权限"),
-            );
+            return copyShareText(content).then((ok) => {
+              onToast?.(ok ? "已复制文件内容" : "复制失败，请检查剪贴板权限");
+              return ok;
+            });
           }}
         />
       )}

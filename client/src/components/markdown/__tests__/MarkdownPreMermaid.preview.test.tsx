@@ -11,7 +11,10 @@ const standaloneSvg = normalizeStandaloneMermaidSvg(svg);
 
 vi.mock("mermaid", () => ({
   default: {
-    mermaidAPI: { getConfig: vi.fn(() => ({ secure: ["securityLevel"] })) },
+    mermaidAPI: {
+      defaultConfig: { secure: ["secure", "securityLevel", "maxEdges"] },
+      getConfig: vi.fn(() => ({ secure: ["securityLevel"] })),
+    },
     initialize: vi.fn(),
     render: vi.fn(async () => ({ svg })),
   },
@@ -31,10 +34,18 @@ describe("Mermaid 图表预览", () => {
     vi.mocked(isTauri).mockReturnValue(false);
     Object.defineProperty(URL, "createObjectURL", { configurable: true, value: vi.fn(() => "blob:diagram") });
     Object.defineProperty(URL, "revokeObjectURL", { configurable: true, value: vi.fn() });
+    // jsdom has no layout; provide a measurable preview viewport.
+    vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockImplementation(function (this: HTMLElement) {
+      return this.classList.contains("md-image-preview__stage") ? 800 : 0;
+    });
+    vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockImplementation(function (this: HTMLElement) {
+      return this.classList.contains("md-image-preview__stage") ? 600 : 0;
+    });
   });
 
   afterEach(() => {
     cleanup();
+    vi.restoreAllMocks();
     if (originalCreate) Object.defineProperty(URL, "createObjectURL", originalCreate);
     else Reflect.deleteProperty(URL, "createObjectURL");
     if (originalRevoke) Object.defineProperty(URL, "revokeObjectURL", originalRevoke);
@@ -72,6 +83,22 @@ describe("Mermaid 图表预览", () => {
     fireEvent.click(screen.getByRole("button", { name: "放大" }));
     expect(onPreviewMermaid).toHaveBeenCalledWith(standaloneSvg, graph);
     expect(screen.queryByRole("dialog", { name: "图表预览" })).toBeNull();
+  });
+
+  it("渲染失败时说明源码只读和重新生成方式，并可通过新内容恢复", async () => {
+    vi.mocked(mermaid.render).mockRejectedValueOnce(new Error("parse error"));
+    const invalid = "flowchart LR\n A[";
+    const { container, rerender } = render(<MarkdownPreMermaid content={invalid} />);
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("已保留只读源码");
+    expect(alert).toHaveTextContent("让助手修正后重新生成图表");
+    expect(container.querySelector(".md-mermaid-source code")?.textContent).toBe(invalid);
+    expect(screen.queryByRole("textbox")).toBeNull();
+    expect(screen.queryByRole("button", { name: "下载" })).toBeNull();
+
+    rerender(<MarkdownPreMermaid content={graph} />);
+    await screen.findByRole("button", { name: "放大预览图表" });
+    expect(screen.queryByRole("alert")).toBeNull();
   });
 
   it("为独立 SVG 禁用 HTML 标签并固定中文字体，避免节点文字按不同字体计算宽度", async () => {
