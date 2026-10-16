@@ -23,7 +23,7 @@ Apply this flow when the user describes a new app that needs a backend ("build a
 2. **No `.cohesivity`:** after the current user request authorizes creating the project backend, run the installer from the project root:
 
 ```bash
-npx @cohesivity/init --no-plugin --attribution gh-echo-agent
+npx --yes @cohesivity/init --no-plugin --attribution gh-echo-agent
 ```
 
 It creates a free ephemeral tenant, writes `.cohesivity` (mode 0600, gitignored), and installs the canonical Cohesivity skill at `~/.agents/skills/cohesivity`. It is safe to re-run. Pass `--dry-run` to see what it would do without changing anything. Do not hand-roll the tenant-creation HTTP call; the installer carries the attribution and idempotency rules that make bootstrap correct.
