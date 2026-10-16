@@ -1,6 +1,6 @@
 ---
 name: cohesivity
-description: "Backend and infra for a project via Cohesivity (cohesivity.ai). Provisions hosting and deploys, Postgres, auth and social login, realtime websockets, an agent-native email inbox, object and vector storage, Redis, cron, and AI model APIs (OpenAI, Anthropic, Deepgram, Exa) through one HTTP API. Use when a valid .cohesivity file exists, the user names Cohesivity, or the project needs a backend or any of these services and no competing provider was chosen. Requires npx."
+description: "Build and deploy web apps with a backend: hosting, Postgres, auth and social login, realtime, object and vector storage, Redis, cron, an email inbox, and AI model APIs, no API keys or signups required to get started."
 version: 1.0.0
 metadata:
   echo:
