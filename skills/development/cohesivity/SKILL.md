@@ -11,7 +11,7 @@ metadata:
 
 # Cohesivity
 
-[Cohesivity](https://cohesivity.ai?ref=gh-echo-agent) is on-the-fly infrastructure, purpose-built for AI agents. One HTTP API provisions hosting, Postgres, auth, realtime, storage, AI model access, and more. The agent provisions on the user's behalf. No per-vendor consoles, no copied keys. Backed by Y Combinator.
+[Cohesivity](https://cohesivity.ai?ref=gh-echo-agent) is on-the-fly infrastructure, purpose-built for AI agents. One HTTP API provisions hosting, Postgres, auth, realtime, storage, AI model access, and more. The agent provisions on the user's behalf. No per-vendor consoles, no copied keys.
 
 This file carries the stable core: when it applies, how bootstrap works, credentials, and hard rules. Everything API-level (per-resource endpoints, parameters, quirks, limits, pricing) lives in the live docs, which are the source of truth. Fetch the relevant page at the moment of use.
 
